@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { b64, equal, fromUtf8, unb64, utf8 } from './bytes';
+import { b64, equal, fromUtf8, random, unb64, utf8 } from './bytes';
 import { pad, unpad } from './padding';
-import { LABEL, newDHKeyPair, newIdentity, sign, type Identity, type KeyPair } from './protocol';
+import { LABEL, newDHKeyPair, newIdentity, sign, type Identity, type KeyPair, type PublicIdentity } from './protocol';
 import { decrypt, encrypt, initAlice, initBob, MAX_SKIP, RatchetError } from './ratchet';
 import { safetyNumber } from './safety';
 import { DecryptError, SessionCipher, type KeyStore, type SessionRecord } from './session';
@@ -189,7 +189,11 @@ class MemoryStore implements KeyStore {
   }
 }
 
-function cipherFor(p: Party, directory: Map<string, Party>) {
+function cipherFor(
+  p: Party,
+  directory: Map<string, Party>,
+  checkIdentity: (peer: string, id: PublicIdentity) => Promise<void> = async () => {},
+) {
   const store = new MemoryStore(p);
   const cipher = new SessionCipher(store, {
     fetchBundle: async (peer) => {
@@ -197,9 +201,34 @@ function cipherFor(p: Party, directory: Map<string, Party>) {
       const b = bundleOf(target, target.opks.size > 0);
       return b;
     },
-    checkIdentity: async () => {},
+    checkIdentity,
   });
   return { store, cipher };
+}
+
+const pub = (p: Party): PublicIdentity => ({ sigKey: p.id.sig.pub, dhKey: p.id.dh.pub });
+const sameIdentity = (a: PublicIdentity, b: PublicIdentity) => equal(a.sigKey, b.sigKey) && equal(a.dhKey, b.dhKey);
+
+/**
+ * A checkIdentity hook with the app's semantics: trust on first use, and a
+ * different identity later is re-pinned (unverified) and recorded.
+ */
+function pinning() {
+  const pins = new Map<string, PublicIdentity>();
+  const events: string[] = [];
+  const check = async (peer: string, id: PublicIdentity) => {
+    const pinned = pins.get(peer);
+    if (pinned && sameIdentity(pinned, id)) return;
+    events.push(pinned ? 'changed' : 'tofu');
+    pins.set(peer, id);
+  };
+  return { pins, events, check };
+}
+
+/** The identity the user is shown for `peer` is the one their messages go to. */
+async function expectBound(store: MemoryStore, peer: string, pins: Map<string, PublicIdentity>) {
+  const rec = await store.loadSession(peer);
+  expect(sameIdentity(rec!.current!.peer, pins.get(peer)!)).toBe(true);
 }
 
 describe('session cipher', () => {
@@ -304,6 +333,312 @@ describe('session cipher', () => {
     const envs = await Promise.all(Array.from({ length: 20 }, (_, i) => A.cipher.encrypt('bob', utf8(String(i)))));
     const out = await Promise.all(envs.map((e) => B.cipher.decrypt('alice', e)));
     expect(out.map(fromUtf8)).toEqual(Array.from({ length: 20 }, (_, i) => String(i)));
+  });
+
+  it('reports malformed and hostile envelopes as DecryptError', async () => {
+    const alice = party('alice');
+    const bob = party('bob');
+    const dir = new Map([
+      ['alice', alice],
+      ['bob', bob],
+    ]);
+    const A = cipherFor(alice, dir);
+    const bobPins = pinning();
+    const B = cipherFor(bob, dir, bobPins.check);
+    const first = JSON.parse(await A.cipher.encrypt('bob', utf8('first')));
+    const zero = b64(new Uint8Array(32)); // a low-order point
+    for (const mutate of [
+      (e: typeof first) => (e.h.d = '!!'),
+      (e: typeof first) => (e.c = 'a'),
+      (e: typeof first) => (e.x.e = 'AAAA'),
+      (e: typeof first) => (e.x.i = zero),
+      (e: typeof first) => (e.x.e = zero),
+      (e: typeof first) => (e.h.d = zero),
+    ]) {
+      const env = structuredClone(first);
+      mutate(env);
+      await expect(B.cipher.decrypt('alice', JSON.stringify(env))).rejects.toThrow(DecryptError);
+    }
+    expect(bobPins.events).toEqual([]);
+    expect(await B.cipher.hasSession('alice')).toBe(false);
+    expect(bob.opks.size).toBe(3);
+
+    expect(fromUtf8(await B.cipher.decrypt('alice', JSON.stringify(first)))).toBe('first');
+    const next = JSON.parse(await A.cipher.encrypt('bob', utf8('next')));
+    delete next.x;
+    next.h.d = zero; // on an existing session
+    await expect(B.cipher.decrypt('alice', JSON.stringify(next))).rejects.toThrow(DecryptError);
+  });
+});
+
+describe('session identity binding', () => {
+  it('only trusts the identity in a prekey message once the message decrypts', async () => {
+    const alice = party('alice');
+    const bob = party('bob');
+    const mallory = party('mallory');
+    const dir = new Map([
+      ['alice', alice],
+      ['bob', bob],
+    ]);
+    const A = cipherFor(alice, dir);
+    const bobPins = pinning();
+    const B = cipherFor(bob, dir, bobPins.check);
+    const M = cipherFor(mallory, dir);
+    expect(fromUtf8(await B.cipher.decrypt('alice', await A.cipher.encrypt('bob', utf8('hello'))))).toBe('hello');
+    expect(fromUtf8(await A.cipher.decrypt('bob', await B.cipher.encrypt('alice', utf8('hi'))))).toBe('hi');
+    expect(bobPins.events).toEqual(['tofu']);
+
+    // The server delivers Mallory's genuine session as "alice": accepted, but flagged.
+    expect(fromUtf8(await B.cipher.decrypt('alice', await M.cipher.encrypt('bob', utf8('mitm'))))).toBe('mitm');
+    expect(bobPins.events).toEqual(['tofu', 'changed']);
+
+    // A junk prekey message claiming Alice's real identity must not re-pin
+    // it, or Bob's safety number would match Alice's while he talks to Mallory.
+    const junk = {
+      v: 1,
+      h: { d: b64(newDHKeyPair().pub), p: 0, n: 0 },
+      c: b64(random(300)),
+      x: { s: b64(alice.id.sig.pub), i: b64(alice.id.dh.pub), e: b64(newDHKeyPair().pub), k: bob.spk.keyId },
+    };
+    await expect(B.cipher.decrypt('alice', JSON.stringify(junk))).rejects.toThrow(DecryptError);
+    expect(bobPins.events).toEqual(['tofu', 'changed']);
+    const sn = (id: PublicIdentity) => safetyNumber({ username: 'bob', identity: pub(bob) }, { username: 'alice', identity: id });
+    const shown = sn(bobPins.pins.get('alice')!);
+    expect(shown).toEqual(sn(pub(mallory)));
+    expect(shown).not.toEqual(sn(pub(alice)));
+    await expectBound(B.store, 'alice', bobPins.pins);
+
+    // Same for a peer seen for the first time: nothing is pinned or stored.
+    const carol = party('carol');
+    const carolPins = pinning();
+    const C = cipherFor(carol, dir, carolPins.check);
+    const toCarol = JSON.stringify({ ...junk, x: { ...junk.x, k: carol.spk.keyId } });
+    await expect(C.cipher.decrypt('alice', toCarol)).rejects.toThrow(DecryptError);
+    expect(carolPins.events).toEqual([]);
+    expect(await C.cipher.hasSession('alice')).toBe(false);
+  });
+
+  it('re-checks the identity of an existing session on every send and receive', async () => {
+    const alice = party('alice');
+    const bob = party('bob');
+    const dir = new Map([
+      ['alice', alice],
+      ['bob', bob],
+    ]);
+    const seenByA: PublicIdentity[] = [];
+    const seenByB: PublicIdentity[] = [];
+    const A = cipherFor(alice, dir, async (_, id) => void seenByA.push(id));
+    const B = cipherFor(bob, dir, async (_, id) => void seenByB.push(id));
+
+    await B.cipher.decrypt('alice', await A.cipher.encrypt('bob', utf8('1'))); // A: bundle, B: new session
+    await A.cipher.decrypt('bob', await B.cipher.encrypt('alice', utf8('2'))); // B: send, A: receive
+    await B.cipher.decrypt('alice', await A.cipher.encrypt('bob', utf8('3'))); // A: send, B: receive
+    expect(seenByA).toHaveLength(3);
+    expect(seenByB).toHaveLength(3);
+    expect(seenByA.every((id) => sameIdentity(id, pub(bob)))).toBe(true);
+    expect(seenByB.every((id) => sameIdentity(id, pub(alice)))).toBe(true);
+  });
+
+  it('persists nothing when the identity is refused and passes the error through', async () => {
+    class Offline extends Error {}
+    const alice = party('alice');
+    const bob = party('bob');
+    const dir = new Map([
+      ['alice', alice],
+      ['bob', bob],
+    ]);
+    let refuse = false;
+    const A = cipherFor(alice, dir);
+    const B = cipherFor(bob, dir, async () => {
+      if (refuse) throw new Offline('try again later');
+    });
+
+    // A new session: neither the session nor the one-time prekey use is kept.
+    const e1 = await A.cipher.encrypt('bob', utf8('e1'));
+    refuse = true;
+    await expect(B.cipher.decrypt('alice', e1)).rejects.toBeInstanceOf(Offline);
+    expect(await B.cipher.hasSession('alice')).toBe(false);
+    expect(bob.opks.size).toBe(3);
+    refuse = false;
+    expect(fromUtf8(await B.cipher.decrypt('alice', e1))).toBe('e1');
+    expect(bob.opks.size).toBe(2);
+
+    // An existing session: its state does not advance, so a retry works.
+    const e2 = await A.cipher.encrypt('bob', utf8('e2'));
+    const before = await B.store.loadSession('alice');
+    refuse = true;
+    await expect(B.cipher.decrypt('alice', e2)).rejects.toBeInstanceOf(Offline);
+    expect(await B.store.loadSession('alice')).toEqual(before);
+    refuse = false;
+    expect(fromUtf8(await B.cipher.decrypt('alice', e2))).toBe('e2');
+
+    // Sending.
+    const before2 = await B.store.loadSession('alice');
+    refuse = true;
+    await expect(B.cipher.encrypt('alice', utf8('r'))).rejects.toBeInstanceOf(Offline);
+    expect(await B.store.loadSession('alice')).toEqual(before2);
+    refuse = false;
+    expect(fromUtf8(await A.cipher.decrypt('bob', await B.cipher.encrypt('alice', utf8('r'))))).toBe('r');
+  });
+
+  it('checks a bundle signature before trusting its identity', async () => {
+    const alice = party('alice');
+    const bob = party('bob');
+    const mallory = party('mallory');
+    const pins = pinning();
+    const forged = bundleOf(bob);
+    forged.dhKey = mallory.id.dh.pub;
+    const A = new SessionCipher(new MemoryStore(alice), { fetchBundle: async () => forged, checkIdentity: pins.check });
+    await expect(A.encrypt('bob', utf8('hi'))).rejects.toThrow(BundleVerificationError);
+    expect(pins.events).toEqual([]);
+  });
+
+  it('never silently falls back to a session with a replaced identity', async () => {
+    const alice = party('alice');
+    const bob = party('bob');
+    const mallory = party('mallory');
+    const dir = new Map([['alice', alice]]);
+    const alicePins = pinning();
+    const A = cipherFor(alice, dir, alicePins.check);
+    const B = cipherFor(bob, dir);
+    const M = cipherFor(mallory, dir);
+
+    // The server introduces Mallory as "bob"; Alice answers her.
+    expect(fromUtf8(await A.cipher.decrypt('bob', await M.cipher.encrypt('alice', utf8('m1'))))).toBe('m1');
+    expect(fromUtf8(await M.cipher.decrypt('alice', await A.cipher.encrypt('bob', utf8('a1'))))).toBe('a1');
+    // The real Bob shows up; Alice is told and can now verify him.
+    expect(fromUtf8(await A.cipher.decrypt('bob', await B.cipher.encrypt('alice', utf8('b1'))))).toBe('b1');
+    expect(alicePins.events).toEqual(['tofu', 'changed']);
+    await expectBound(A.store, 'bob', alicePins.pins);
+
+    // Mallory's session must not quietly take over again.
+    const m2 = await M.cipher.encrypt('alice', utf8('m2'));
+    expect(JSON.parse(m2).x).toBeUndefined();
+    await expect(A.cipher.decrypt('bob', m2)).rejects.toThrow(DecryptError);
+    expect(alicePins.events).toEqual(['tofu', 'changed']);
+    await expectBound(A.store, 'bob', alicePins.pins);
+    const out = await A.cipher.encrypt('bob', utf8('for bob'));
+    expect(fromUtf8(await B.cipher.decrypt('alice', out))).toBe('for bob');
+    await expect(M.cipher.decrypt('alice', out)).rejects.toThrow(DecryptError);
+  });
+
+  it('lets a replaced identity back in only as a new, flagged change', async () => {
+    for (const opks of [3, 0]) {
+      const alice = party('alice', opks);
+      const bob = party('bob');
+      const mallory = party('mallory');
+      const dir = new Map([['alice', alice]]);
+      const alicePins = pinning();
+      const A = cipherFor(alice, dir, alicePins.check);
+      const B = cipherFor(bob, dir);
+      const M = cipherFor(mallory, dir);
+
+      await A.cipher.decrypt('bob', await M.cipher.encrypt('alice', utf8('m1')));
+      await A.cipher.decrypt('bob', await B.cipher.encrypt('alice', utf8('b1')));
+      expect(alicePins.events).toEqual(['tofu', 'changed']);
+      // Sessions bound to the replaced identity are gone.
+      const rec = await A.store.loadSession('bob');
+      expect([rec!.current!, ...rec!.previous].every((s) => sameIdentity(s.peer, pub(bob)))).toBe(true);
+
+      // Mallory never got an answer, so her next message still carries her
+      // prekey header. Its one-time prekey is spent; without one it can only
+      // come back in as a new session, flagged like any identity change.
+      const m2 = await M.cipher.encrypt('alice', utf8('m2'));
+      expect(JSON.parse(m2).x).toBeDefined();
+      if (opks) {
+        await expect(A.cipher.decrypt('bob', m2)).rejects.toThrow(/one-time prekey already used/);
+        expect(alicePins.events).toEqual(['tofu', 'changed']);
+      } else {
+        expect(fromUtf8(await A.cipher.decrypt('bob', m2))).toBe('m2');
+        expect(alicePins.events).toEqual(['tofu', 'changed', 'changed']);
+      }
+      await expectBound(A.store, 'bob', alicePins.pins);
+    }
+  });
+
+  it('never promotes a stored session bound to another identity', async () => {
+    const alice = party('alice');
+    const bob = party('bob');
+    const mallory = party('mallory');
+    const dir = new Map([['alice', alice]]);
+    const alicePins = pinning();
+    const A = cipherFor(alice, dir, alicePins.check);
+    const B = cipherFor(bob, dir);
+    const M = cipherFor(mallory, dir);
+
+    await A.cipher.decrypt('bob', await M.cipher.encrypt('alice', utf8('m1')));
+    const stale = (await A.store.loadSession('bob'))!.current!;
+    await A.cipher.decrypt('bob', await B.cipher.encrypt('alice', utf8('b1')));
+    // A record that still holds Mallory's session behind Bob's.
+    const rec = (await A.store.loadSession('bob'))!;
+    await A.store.saveSession('bob', { current: rec.current, previous: [stale] });
+
+    const m2 = JSON.parse(await M.cipher.encrypt('alice', utf8('m2')));
+    await expect(A.cipher.decrypt('bob', JSON.stringify(m2))).rejects.toThrow(/duplicate prekey message/);
+    delete m2.x; // the server can strip the prekey header
+    await expect(A.cipher.decrypt('bob', JSON.stringify(m2))).rejects.toThrow(/no session can decrypt/);
+    expect(alicePins.events).toEqual(['tofu', 'changed']);
+    await expectBound(A.store, 'bob', alicePins.pins);
+  });
+});
+
+describe('prekey replay', () => {
+  // Spells a 32-byte base64url value differently: its last character has two
+  // unused low bits, which decoders ignore.
+  function respell(s: string): string {
+    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+    return s.slice(0, -1) + alphabet[alphabet.indexOf(s[s.length - 1]) | 1];
+  }
+
+  it('rejects a replayed prekey message that used no one-time prekey', async () => {
+    const alice = party('alice');
+    const bob = party('bob', 0); // out of one-time prekeys (or the server left it out)
+    const dir = new Map([
+      ['alice', alice],
+      ['bob', bob],
+    ]);
+    const A = cipherFor(alice, dir);
+    const B = cipherFor(bob, dir);
+    const e1 = await A.cipher.encrypt('bob', utf8('timer off'));
+    expect(JSON.parse(e1).x.o).toBeUndefined();
+    expect(fromUtf8(await B.cipher.decrypt('alice', e1))).toBe('timer off');
+    expect(fromUtf8(await A.cipher.decrypt('bob', await B.cipher.encrypt('alice', utf8('ok'))))).toBe('ok');
+
+    for (let i = 0; i < 4; i++) {
+      await expect(B.cipher.decrypt('alice', e1)).rejects.toThrow(/duplicate prekey message/);
+    }
+    const respelled = JSON.parse(e1);
+    respelled.x.e = respell(respelled.x.e);
+    expect(respelled.x.e).not.toBe(JSON.parse(e1).x.e);
+    expect(equal(unb64(respelled.x.e), unb64(JSON.parse(e1).x.e))).toBe(true);
+    await expect(B.cipher.decrypt('alice', JSON.stringify(respelled))).rejects.toThrow(/duplicate prekey message/);
+
+    // The live session is untouched and the conversation carries on.
+    expect((await B.store.loadSession('alice'))!.previous).toHaveLength(0);
+    for (let i = 0; i < 3; i++) {
+      expect(fromUtf8(await B.cipher.decrypt('alice', await A.cipher.encrypt('bob', utf8(`a${i}`))))).toBe(`a${i}`);
+      expect(fromUtf8(await A.cipher.decrypt('bob', await B.cipher.encrypt('alice', utf8(`b${i}`))))).toBe(`b${i}`);
+    }
+  });
+
+  it('still accepts prekey messages that arrive out of order or respelled', async () => {
+    const alice = party('alice');
+    const bob = party('bob', 0);
+    const dir = new Map([
+      ['alice', alice],
+      ['bob', bob],
+    ]);
+    const A = cipherFor(alice, dir);
+    const B = cipherFor(bob, dir);
+    const e1 = await A.cipher.encrypt('bob', utf8('1'));
+    const e2 = await A.cipher.encrypt('bob', utf8('2'));
+    const e3 = JSON.parse(await A.cipher.encrypt('bob', utf8('3')));
+    e3.x.e = respell(e3.x.e);
+    expect(fromUtf8(await B.cipher.decrypt('alice', e2))).toBe('2');
+    expect(fromUtf8(await B.cipher.decrypt('alice', JSON.stringify(e3)))).toBe('3');
+    expect(fromUtf8(await B.cipher.decrypt('alice', e1))).toBe('1');
+    await expect(B.cipher.decrypt('alice', e2)).rejects.toThrow(/duplicate prekey message/);
+    expect((await B.store.loadSession('alice'))!.previous).toHaveLength(0);
   });
 });
 
