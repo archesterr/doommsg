@@ -93,7 +93,7 @@ jobs:
         env:
           DOOMMSG_SERVER_BIN: ${{ runner.temp }}/doommsg-server
         run: npx playwright test
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: playwright-traces
