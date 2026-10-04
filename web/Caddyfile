@@ -1,0 +1,47 @@
+# DoomMsg edge: static client + API/WebSocket reverse proxy.
+# DOOMMSG_DOMAIN=chat.example.com gives automatic Let's Encrypt TLS;
+# set it to ":80" to run behind another TLS-terminating proxy.
+{
+	admin off
+	servers {
+		protocols h1 h2 h3
+	}
+}
+
+{$DOOMMSG_DOMAIN::80} {
+	encode zstd gzip
+
+	# Privacy: no access logs (they would record who talks to the relay).
+	log {
+		output discard
+	}
+
+	header {
+		-Server
+		# Keep in sync with web/vite.config.ts (securityHeaders).
+		Content-Security-Policy "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; require-trusted-types-for 'script'; trusted-types 'none'; upgrade-insecure-requests"
+		Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+		Permissions-Policy "camera=(self), microphone=(self), geolocation=(), payment=(), usb=(), interest-cohort=()"
+		Referrer-Policy "no-referrer"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Cross-Origin-Opener-Policy "same-origin"
+		Cross-Origin-Resource-Policy "same-origin"
+	}
+
+	handle /api/* {
+		# Caddy ignores client-supplied X-Forwarded-For (no trusted_proxies)
+		# and sets it to the real peer address; the relay rate-limits on it.
+		reverse_proxy {$DOOMMSG_UPSTREAM:server:8080}
+	}
+
+	handle {
+		root * /srv
+		@hashed path /assets/*
+		header @hashed Cache-Control "public, max-age=31536000, immutable"
+		@html path / /index.html
+		header @html Cache-Control "no-cache"
+		try_files {path} /index.html
+		file_server
+	}
+}
