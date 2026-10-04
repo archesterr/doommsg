@@ -1,0 +1,19 @@
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /server
+    schedule: { interval: weekly }
+    groups:
+      go-deps: { patterns: ["*"] }
+  - package-ecosystem: npm
+    directory: /web
+    schedule: { interval: weekly }
+    groups:
+      npm-dev: { dependency-type: development }
+      npm-prod: { dependency-type: production }
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }
+  - package-ecosystem: docker
+    directories: [/server, /web]
+    schedule: { interval: weekly }

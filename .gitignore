@@ -1,0 +1,20 @@
+# Go
+/server/doommsg-server
+*.db
+*.db-shm
+*.db-wal
+
+# Web
+node_modules/
+/web/dist/
+/web/test-results/
+/web/playwright-report/
+*.tsbuildinfo
+
+# Deploy secrets
+/deploy/.env
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
