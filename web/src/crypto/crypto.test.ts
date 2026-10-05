@@ -582,6 +582,43 @@ describe('session identity binding', () => {
   });
 });
 
+describe('trusted identity', () => {
+  it('starts a new session instead of sending on one bound to an identity no longer trusted', async () => {
+    const alice = party('alice');
+    const oldBob = party('bob');
+    const newBob = party('bob');
+    const dir = new Map([
+      ['alice', alice],
+      ['bob', oldBob],
+    ]);
+    const { pins, events, check } = pinning();
+    const store = new MemoryStore(alice);
+    const A = new SessionCipher(store, {
+      fetchBundle: async (peer) => bundleOf(dir.get(peer)!),
+      checkIdentity: check,
+      trustedIdentity: (peer) => pins.get(peer),
+    });
+    const B1 = cipherFor(oldBob, dir);
+    await B1.cipher.decrypt('alice', await A.encrypt('bob', utf8('hi')));
+    await A.decrypt('bob', await B1.cipher.encrypt('alice', utf8('hi alice')));
+
+    // The chat is deleted and bob added again: the directory now has a new key.
+    dir.set('bob', newBob);
+    pins.set('bob', pub(newBob));
+    const B2 = cipherFor(newBob, dir);
+    const env = await A.encrypt('bob', utf8('for the new key'));
+
+    expect(JSON.parse(env).x).toBeDefined(); // a fresh session
+    expect(fromUtf8(await B2.cipher.decrypt('alice', env))).toBe('for the new key');
+    await expect(B1.cipher.decrypt('alice', env)).rejects.toThrow();
+    expect(sameIdentity(pins.get('bob')!, pub(newBob))).toBe(true);
+    expect(events).toEqual(['tofu']); // never re-pinned to the old key
+    await expectBound(store, 'bob', pins);
+    // The abandoned session is not kept to fall back on.
+    expect((await store.loadSession('bob'))!.previous.every((s) => sameIdentity(s.peer, pub(newBob)))).toBe(true);
+  });
+});
+
 describe('prekey replay', () => {
   // Spells a 32-byte base64url value differently: its last character has two
   // unused low bits, which decoders ignore.

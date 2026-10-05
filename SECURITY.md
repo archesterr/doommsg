@@ -72,7 +72,9 @@ pre-production for high-risk use.
   session state.
 - A peer's claimed identity is trusted only after its first message
   decrypts, and every later send and receive is checked against the pinned
-  key. A replayed prekey message is rejected while the session it created is
+  key. Messages are only sent on a session bound to the key the user is
+  shown. A session bound to another key, for example after a chat is
+  deleted and the contact added again, is abandoned rather than re-trusted. A replayed prekey message is rejected while the session it created is
   still among the last four kept for that contact. As in X3DH, a replay of an
   initial message sent without a one-time prekey is not detectable after
   that. Such a replay can only resend an old message and briefly switch the

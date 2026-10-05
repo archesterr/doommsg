@@ -139,6 +139,7 @@ export class Messenger {
     this.cipher = new SessionCipher(localKeyStore, {
       fetchBundle: (peer) => this.api.bundle(peer),
       checkIdentity: (peer, id) => this.checkIdentity(peer, id),
+      trustedIdentity: (peer) => this.contact(peer)?.identity,
     });
   }
 

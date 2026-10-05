@@ -44,6 +44,12 @@ export interface SessionHooks {
    * passed through unchanged.
    */
   checkIdentity(peer: string, identity: PublicIdentity): Promise<void>;
+  /**
+   * The identity the user currently trusts for `peer`, if any. A session
+   * bound to another identity is not sent on: a new one is started from the
+   * peer's current bundle instead.
+   */
+  trustedIdentity?(peer: string): PublicIdentity | undefined;
 }
 
 const MAX_PREVIOUS = 3;
@@ -100,8 +106,17 @@ export class SessionCipher {
     return this.lock.run(peer, async () => {
       const rec = (await this.store.loadSession(peer)) ?? { previous: [] };
       // Only ever send to the identity the user is shown (and may verify).
+      // A session bound to another one (say the chat was deleted and the
+      // contact added again with a new key) is abandoned, not re-trusted.
+      const trusted = this.hooks.trustedIdentity?.(peer);
+      if (rec.current && trusted && !sameIdentity(rec.current.peer, trusted)) rec.current = undefined;
       if (rec.current) await this.hooks.checkIdentity(peer, rec.current.peer);
-      else rec.current = await this.startSession(peer);
+      else {
+        const s = await this.startSession(peer);
+        // Sessions with any other identity are dead, as on the receiving side.
+        rec.previous = rec.previous.filter((p) => sameIdentity(p.peer, s.peer)).slice(0, MAX_PREVIOUS);
+        rec.current = s;
+      }
       const s = rec.current;
       const { header, ciphertext } = encrypt(s.state, pad(plaintext));
       const env: WireEnvelope = {

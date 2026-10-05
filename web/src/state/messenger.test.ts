@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { b64, fromUtf8, random, unb64, utf8 } from '../crypto/bytes';
-import { newIdentity, type Identity } from '../crypto/protocol';
+import { LABEL, newDHKeyPair, newIdentity, sign, type Identity } from '../crypto/protocol';
 import { SessionCipher, type KeyStore, type SessionRecord } from '../crypto/session';
 import type { PreKeyBundle } from '../crypto/x3dh';
 import { ApiError } from '../net/api';
@@ -312,6 +312,42 @@ describe('deleted chats (#10)', () => {
 
     // Adding him again shows the contact, still blocked.
     expect(await h.m.addContact('bob')).toMatchObject({ blocked: true, hidden: false });
+  });
+
+  it('sends to the new key after the chat is deleted and the contact added again', async () => {
+    const { request } = await createIdentity('alice');
+    const h = harness();
+    const oldBob = newIdentity();
+    let dirId = oldBob;
+    h.m.api.identityOf = async () => ({ sigKey: dirId.sig.pub, dhKey: dirId.dh.pub, dhKeySig: dirId.dhSig });
+    const bob = new SessionCipher(new MemoryStore(oldBob), {
+      fetchBundle: async () => bundleOf(request),
+      checkIdentity: async () => {},
+    });
+    h.deliver({ sid: 1, from: 'bob', payload: await bob.encrypt('alice', utf8(text('m1', 'hi'))) });
+    await h.idle();
+    await h.m.deleteChat('bob');
+
+    // Bob's account is now someone else's key: adding him again pins it.
+    const newBob = newIdentity();
+    const spk = { ...newDHKeyPair(), keyId: 42 };
+    dirId = newBob;
+    h.m.api.bundle = async () => ({
+      sigKey: newBob.sig.pub,
+      dhKey: newBob.dh.pub,
+      dhKeySig: newBob.dhSig,
+      signedPreKey: { keyId: spk.keyId, pub: spk.pub, sig: sign(newBob.sig.priv, LABEL.signedPreKey, spk.pub) },
+    });
+    await h.m.addContact('bob');
+    await h.m.sendText('bob', 'hello');
+    await until(() => h.sent.length > 0);
+
+    // A fresh session to the new key, not the old one; nothing re-pinned.
+    const env = JSON.parse(h.sent[h.sent.length - 1].payload);
+    expect(env.x).toMatchObject({ k: 42 });
+    await expect(bob.decrypt('alice', h.sent[h.sent.length - 1].payload)).rejects.toThrow();
+    expect(h.m.contact('bob')?.identity.sigKey).toEqual(newBob.sig.pub);
+    expect(h.m.contact('bob')?.identityChanged).toBeUndefined();
   });
 
   it('does not silently drop an undecryptable message from someone without a chat', async () => {
