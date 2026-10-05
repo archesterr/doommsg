@@ -20,7 +20,7 @@ jobs:
       run:
         working-directory: server
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: actions/setup-go@v5
@@ -45,7 +45,7 @@ jobs:
       run:
         working-directory: web
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: actions/setup-node@v4
@@ -67,7 +67,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [server, web]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: actions/setup-go@v5
@@ -105,7 +105,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [server, web]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: docker/setup-buildx-action@v3
@@ -137,7 +137,7 @@ jobs:
       # The same image as Docker Hub's coturn/coturn, without its pull limit.
       COTURN_IMAGE: mirror.gcr.io/coturn/coturn:4.6-alpine
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Validate docker-compose.yml
