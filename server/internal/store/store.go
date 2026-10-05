@@ -467,6 +467,15 @@ func (s *Store) Pending(ctx context.Context, recipientID, after int64, limit int
 	return out, rows.Err()
 }
 
+// LastEnvelope returns the id of the newest envelope queued for
+// recipientID, or 0 when there is none. Ids only ever grow.
+func (s *Store) LastEnvelope(ctx context.Context, recipientID int64) (int64, error) {
+	var id int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COALESCE(MAX(id), 0) FROM mailbox WHERE recipient_id = ?`, recipientID).Scan(&id)
+	return id, err
+}
+
 // Ack deletes delivered envelopes. Only the recipient can delete them.
 func (s *Store) Ack(ctx context.Context, recipientID int64, ids []int64) error {
 	if len(ids) == 0 {

@@ -514,6 +514,52 @@ func TestLargeBacklogSyncs(t *testing.T) {
 	e.waitMailbox(uid, 0)
 }
 
+// Envelopes sent while a backlog drains reach the recipient once, live,
+// and not a second time at the end of the flush.
+func TestFlushSkipsEnvelopesDeliveredLive(t *testing.T) {
+	e := newFileEnv(t, func(c *config.Config) { c.MailboxMax = 10000 })
+	carol := e.newAccount("carol", 0)
+	bob := e.newAccount("bob", 0)
+	const backlog, live = 600, 20
+	e.fill("bob", backlog, strings.Repeat("A", 2000)) // from alice
+
+	aw := e.dial(carol.token)
+	recv(t, aw) // synced
+	bw := e.dial(bob.token)
+	first := recv(t, bw) // the flush has started
+	if first["type"] != "msg" {
+		t.Fatalf("expected the backlog, got %v", first)
+	}
+	for i := range live {
+		send(t, aw, frame{"type": "send", "id": fmt.Sprint("m", i), "to": "bob", "payload": "live"})
+		if f := recv(t, aw); f["type"] != "sent" {
+			t.Fatalf("send %d: %v", i, f)
+		}
+	}
+
+	seen := map[any]int{first["sid"]: 1}
+	synced := false
+	for !synced || len(seen) < backlog+live {
+		f := recv(t, bw)
+		switch f["type"] {
+		case "synced":
+			synced = true
+		case "msg":
+			seen[f["sid"]]++
+		default:
+			t.Fatalf("unexpected %v", f)
+		}
+	}
+	for sid, n := range seen {
+		if n > 1 {
+			t.Errorf("envelope %v delivered %d times", sid, n)
+		}
+	}
+	if len(seen) != backlog+live {
+		t.Fatalf("got %d envelopes, want %d", len(seen), backlog+live)
+	}
+}
+
 // Acks are not charged to the send limiter: a client that acks a backlog
 // one envelope at a time, far past the send burst, loses none of them.
 func TestAcksAreNotRateLimited(t *testing.T) {

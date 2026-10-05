@@ -341,16 +341,28 @@ func (h *Hub) handleSend(ctx context.Context, c *conn, in frame) {
 // flush delivers every queued envelope to a freshly connected client,
 // then "synced". The backlog waits for the writer instead of filling the
 // live buffer, so a large mailbox drains at the pace the client reads.
-// Envelopes that also arrive live during the flush are de-duplicated by
-// the client using their server id.
+//
+// It stops at the newest envelope queued before it started: the
+// connection was registered by then, so every later one reaches it live
+// (handleSend looks the recipient up after committing). An envelope that
+// commits just before that point may still arrive both ways; the client
+// drops the second copy by its server id.
 func (h *Hub) flush(ctx context.Context, c *conn) error {
+	last, err := h.opt.Store.LastEnvelope(ctx, c.userID)
+	if err != nil {
+		return err
+	}
 	var after int64
-	for {
+page:
+	for after < last {
 		envs, err := h.opt.Store.Pending(ctx, c.userID, after, flushPage)
 		if err != nil {
 			return err
 		}
 		for _, e := range envs {
+			if e.ID > last {
+				break page
+			}
 			f := frame{Type: "msg", SID: e.ID, From: e.Sender, Payload: string(e.Payload), TS: e.CreatedAt.UnixMilli()}
 			if err := c.sendBacklog(ctx, f); err != nil {
 				return err
@@ -358,9 +370,10 @@ func (h *Hub) flush(ctx context.Context, c *conn) error {
 			after = e.ID
 		}
 		if len(envs) < flushPage {
-			return c.sendBacklog(ctx, frame{Type: "synced"})
+			break
 		}
 	}
+	return c.sendBacklog(ctx, frame{Type: "synced"})
 }
 
 func (c *conn) sendBacklog(ctx context.Context, f frame) error {
