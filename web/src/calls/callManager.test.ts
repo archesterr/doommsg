@@ -402,6 +402,33 @@ describe('camera changes racing the end of the call', () => {
     expect(toast).not.toHaveBeenCalled();
   });
 
+  it('switchCamera() keeps the camera off when it is turned off while the new one opens', async () => {
+    const { pc } = await activeCall('bob', true);
+    const switching = calls.switchCamera();
+    await flush();
+    await calls.toggleCamera(); // camera off during getUserMedia
+    expect(useCall.getState().cameraOff).toBe(true);
+
+    const [cam] = await grant('video');
+    await switching;
+    expect(pc.senders.map((s) => s.track)).toContain(cam);
+    expect(cam.enabled).toBe(false);
+    expect(useCall.getState().cameraOff).toBe(true);
+  });
+
+  it('switchCamera() ignores a second flip while one is opening the camera', async () => {
+    const { tracks } = await activeCall('bob', true);
+    const first = calls.switchCamera();
+    await flush();
+    await calls.switchCamera();
+    expect(gum).toHaveLength(2); // the call's own, plus the first flip only
+
+    const [cam] = await grant('video');
+    await first;
+    expect(tracks.find((t) => t.kind === 'video')!.stopped).toBe(true);
+    expect(useCall.getState().local?.getVideoTracks()).toEqual([cam]);
+  });
+
   it('switchCamera() swaps the sent track on a live call', async () => {
     const { pc, tracks } = await activeCall('bob', true);
     const old = tracks.find((t) => t.kind === 'video')!;
@@ -557,6 +584,39 @@ describe('glare: both sides call each other at once', () => {
     expect(ops()).not.toContain('offer');
     expect(useCall.getState()).toMatchObject({ phase: 'incoming', callId: 'aaaaaaaa-0000-4000-8000-000000000000' });
     expect(h.tone).toBe('ringtone');
+  });
+
+  it('answers the peer busy when its own offer never goes out after winning', async () => {
+    vi.spyOn(crypto, 'randomUUID').mockReturnValue('aaaaaaaa-0000-4000-8000-000000000000');
+    const starting = calls.start('bob', false);
+    await flush();
+    // Bob's offer arrives while ours waits for the microphone: ours wins.
+    await signal('bob', { op: 'offer', callId: 'bbbbbbbb-0000-4000-8000-000000000000', sdp: 'offer-sdp', video: true });
+    expect(useCall.getState().phase).toBe('outgoing');
+    expect(ops()).toEqual([]);
+
+    // The microphone is refused, so our offer is never sent and Bob would
+    // never yield: he is told we are busy, and we log his call as missed.
+    await deny('NotAllowedError');
+    await starting;
+    expect(useCall.getState().phase).toBe('idle');
+    expect(ops()).not.toContain('offer');
+    expect(sent().find((s) => s.op === 'busy')).toMatchObject({ peer: 'bob', callId: 'bbbbbbbb-0000-4000-8000-000000000000' });
+    expect(messenger.recordCall).toHaveBeenCalledWith('bob', 'in', { video: true, outcome: 'missed' });
+  });
+
+  it('owes the peer nothing once its winning offer has gone out', async () => {
+    vi.spyOn(crypto, 'randomUUID').mockReturnValue('aaaaaaaa-0000-4000-8000-000000000000');
+    void calls.start('bob', false);
+    await flush();
+    await signal('bob', { op: 'offer', callId: 'bbbbbbbb-0000-4000-8000-000000000000', sdp: 'offer-sdp', video: false });
+    await grant('audio');
+    expect(ops()).toEqual(['offer']);
+
+    // Bob yields once our offer reaches him; hanging up now only ends ours.
+    await calls.hangup();
+    expect(ops()).toEqual(['offer', 'hangup']);
+    expect(messenger.recordCall).not.toHaveBeenCalledWith('bob', 'in', expect.anything());
   });
 
   it('still answers busy to a third party', async () => {

@@ -78,6 +78,16 @@ class CallManager {
   private polite = false;
   private restarted = false;
   private facing: 'user' | 'environment' = 'user';
+  /** A camera flip is under way; a second one waits for it. */
+  private flipping = false;
+  /** Our offer for the current outgoing call has gone out. */
+  private offerSent = false;
+  /**
+   * A colliding offer we won glare against before ours went out. The peer
+   * only yields once ours arrives, so if ours never does, theirs is
+   * answered as busy (and logged as missed) when our call ends.
+   */
+  private ignoredOffer: { from: string; callId: string; video: boolean } | null = null;
   private statsTimer: ReturnType<typeof setInterval> | null = null;
   /**
    * Bumped by reset(). Async steps capture it before they await and give up,
@@ -295,6 +305,9 @@ class CallManager {
     }
     // Hung up, or already answered, while the offer was on its way.
     if (this.ended(gen)) return release(local, pc);
+    // A peer whose offer collided with ours yields once ours arrives.
+    this.offerSent = true;
+    this.ignoredOffer = null;
     if (useCall.getState().phase !== 'outgoing') return;
     playRingback();
     this.armRing(callId, RING_TIMEOUT, () => void this.finish('cancelled', true));
@@ -407,7 +420,9 @@ class CallManager {
     const s = useCall.getState();
     const old = s.local?.getVideoTracks()[0];
     const pc = this.pc;
-    if (!old || !pc || !s.local) return;
+    const sender = pc?.getSenders().find((x) => x.track === old);
+    if (!old || !pc || !sender || !s.local || this.flipping) return;
+    this.flipping = true;
     const gen = this.gen;
     const facing = this.facing === 'user' ? 'environment' : 'user';
     let cam: MediaStream | undefined;
@@ -415,8 +430,12 @@ class CallManager {
       cam = await navigator.mediaDevices.getUserMedia({ video: videoConstraints(facing) });
       if (this.ended(gen)) return release(cam);
       const vt = cam.getVideoTracks()[0];
-      await pc.getSenders().find((x) => x.track === old)?.replaceTrack(vt);
+      // The camera may have been turned off while it opened: the new track
+      // must not go out live, now or after the swap.
+      vt.enabled = !useCall.getState().cameraOff;
+      await sender.replaceTrack(vt);
       if (this.ended(gen)) return release(cam);
+      vt.enabled = !useCall.getState().cameraOff;
       this.facing = facing;
       s.local.removeTrack(old);
       old.stop();
@@ -425,6 +444,8 @@ class CallManager {
     } catch {
       release(cam);
       if (!this.ended(gen)) toast('call.err.media', 'error');
+    } finally {
+      this.flipping = false;
     }
   }
 
@@ -439,7 +460,11 @@ class CallManager {
         if (s.phase === 'outgoing' && s.peer === from && s.callId && !mine) {
           // Glare: we called each other at the same moment. Both sides keep
           // the call with the smaller id, so exactly one of them survives.
-          if (sig.callId > s.callId) return; // ours wins: the peer yields
+          if (sig.callId > s.callId) {
+            // Ours wins: the peer yields when our offer reaches them.
+            if (!this.offerSent) this.ignoredOffer = { from, callId: sig.callId, video: sig.video };
+            return;
+          }
           // Theirs wins: withdraw ours quietly (the peer ignores it; the hangup
           // only matters if its own call ended meanwhile) and ring for theirs.
           void messenger.sendCallSignal(from, { op: 'hangup', callId: s.callId }).catch(() => {});
@@ -570,7 +595,14 @@ class CallManager {
     this.pendingOffer = null;
     this.remoteCandidates = [];
     this.makingOffer = false;
+    this.offerSent = false;
+    const ignored = this.ignoredOffer;
+    this.ignoredOffer = null;
     useCall.setState(idle, true);
+    if (ignored) {
+      void messenger.sendCallSignal(ignored.from, { op: 'busy', callId: ignored.callId }).catch(() => {});
+      void messenger.recordCall(ignored.from, 'in', { video: ignored.video, outcome: 'missed' }).catch(() => {});
+    }
   }
 }
 
