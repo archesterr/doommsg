@@ -285,6 +285,39 @@ describe('deleted chats (#10)', () => {
     expect(h.acks.flat()).toEqual([1, 2]);
   });
 
+  it('is not brought back by a receipt or typing indicator, only by a message', async () => {
+    const { request } = await createIdentity('alice');
+    const h = harness();
+    const bobId = newIdentity();
+    let lookups = 0;
+    h.m.api.identityOf = async () => {
+      lookups++;
+      return { sigKey: bobId.sig.pub, dhKey: bobId.dh.pub, dhKeySig: bobId.dhSig };
+    };
+    const bob = new SessionCipher(new MemoryStore(bobId), {
+      fetchBundle: async () => bundleOf(request),
+      checkIdentity: async () => {},
+    });
+    const fromBob = async (sid: number | undefined, content: object) =>
+      h.deliver({ sid, from: 'bob', payload: await bob.encrypt('alice', utf8(JSON.stringify(content))), eph: sid === undefined });
+
+    await fromBob(1, JSON.parse(text('m1', 'hi')));
+    await h.idle();
+    await h.m.deleteChat('bob');
+    lookups = 0;
+
+    await fromBob(2, { t: 'receipt', ids: ['x'], s: 'read' });
+    await fromBob(undefined, { t: 'typing', on: true });
+    await h.idle();
+    expect(h.m.contact('bob')).toBeUndefined();
+    expect(lookups).toBe(1); // checked once, then remembered
+
+    await fromBob(3, JSON.parse(text('m2', 'back again')));
+    await h.idle();
+    expect(h.m.contact('bob')?.identity.sigKey).toEqual(bobId.sig.pub);
+    expect(await db.getMessage('m2')).toMatchObject({ body: 'back again' });
+  });
+
   it('keeps a blocked contact blocked after its chat is deleted', async () => {
     const { request } = await createIdentity('alice');
     const h = harness();

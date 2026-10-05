@@ -114,6 +114,12 @@ export class Messenger {
   private expiryTimer: ReturnType<typeof setInterval> | null = null;
   private expiriesLock: Promise<unknown> = Promise.resolve();
   private prekeyJob: Promise<void> | null = null;
+  /**
+   * Directory-checked identities of senders without a chat. The chat itself
+   * is only created by something worth showing (a message or a call), not
+   * by a stray receipt or typing indicator after it was deleted.
+   */
+  private firstContacts = new Map<string, PublicIdentity>();
   private callHandler: CallHandler = () => {};
   private typingSentAt = new Map<string, number>();
 
@@ -344,7 +350,8 @@ export class Messenger {
 
   /**
    * Trust-on-first-use with change detection. A first contact must match
-   * the server directory; later changes are accepted but flagged, and a
+   * the server directory (its chat is created by adoptContact once it sends
+   * something to show); later changes are accepted but flagged, and a
    * verified contact becomes unverified.
    */
   private async checkIdentity(peer: string, id: PublicIdentity): Promise<void> {
@@ -355,10 +362,20 @@ export class Messenger {
       await this.system(peer, 'sys.identityChanged');
       return;
     }
+    const known = this.firstContacts.get(peer);
+    if (known && equal(known.sigKey, id.sigKey) && equal(known.dhKey, id.dhKey)) return;
     const dir = await this.api.identityOf(peer);
     if (!equal(dir.sigKey, id.sigKey) || !equal(dir.dhKey, id.dhKey)) {
       throw new DecryptError('identity does not match directory');
     }
+    this.firstContacts.set(peer, id);
+  }
+
+  /** Creates the chat of a sender who has none, with the identity checked on decryption. */
+  private async adoptContact(peer: string): Promise<void> {
+    const id = this.firstContacts.get(peer);
+    if (!id || this.contact(peer)) return;
+    this.firstContacts.delete(peer);
     await this.saveContact(newContact(peer, id));
   }
 
@@ -743,6 +760,7 @@ export class Messenger {
       case 'text': {
         if (typeof c.body !== 'string' || typeof c.id !== 'string') return;
         if (await db.getMessage(c.id)) return; // duplicate
+        await this.adoptContact(peer);
         const exp = typeof c.exp === 'number' && c.exp > 0 ? c.exp : undefined;
         const msg: ChatMessage = {
           id: c.id,
@@ -811,6 +829,7 @@ export class Messenger {
         break;
       }
       case 'call':
+        if (c.sig?.op === 'offer') await this.adoptContact(peer);
         this.callHandler(peer, c.sig);
         break;
     }
