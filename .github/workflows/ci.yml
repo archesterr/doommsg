@@ -125,3 +125,32 @@ jobs:
           tags: doommsg-web:ci
           cache-from: type=gha,scope=web
           cache-to: type=gha,mode=max,scope=web
+
+  turn:
+    name: TURN relay (coturn)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: deploy
+    env:
+      # The same image as Docker Hub's coturn/coturn, without its pull limit.
+      COTURN_IMAGE: mirror.gcr.io/coturn/coturn:4.6-alpine
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Validate docker-compose.yml
+        run: |
+          secret=$(openssl rand -hex 24)
+          echo "::add-mask::$secret"
+          sed "s/^DOOMMSG_TURN_SECRET=.*/DOOMMSG_TURN_SECRET=$secret/" .env.example > .env
+          docker compose config --quiet
+      - name: Smoke-test coturn as deployed
+        run: ./coturn/smoke-test.sh
+      - name: coturn logs
+        if: failure()
+        run: docker compose logs coturn
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

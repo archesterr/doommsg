@@ -1,4 +1,4 @@
-.PHONY: dev-server dev-web test test-server test-web e2e lint build images up down
+.PHONY: dev-server dev-web test test-server test-web e2e turn-test lint build images up down
 
 dev-server: ## Run the relay locally on :8080
 	cd server && DOOMMSG_DB=dev.db go run ./cmd/doommsg-server
@@ -16,6 +16,9 @@ test-web:
 
 e2e: ## Two-browser end-to-end test against the real relay
 	cd web && npm run build && npx playwright test
+
+turn-test: ## Smoke-test coturn as deployed (needs deploy/.env and Docker)
+	cd deploy && ./coturn/smoke-test.sh
 
 lint:
 	cd server && test -z "$$(gofmt -l .)" && go vet ./...

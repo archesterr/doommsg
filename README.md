@@ -100,6 +100,11 @@ already in use on the host, change it in `docker-compose.yml` (the network,
 coturn's address and the `--external-ip` suffix) and in `allowed-peer-ip` in
 `coturn/turnserver.conf`.
 
+`make turn-test` checks coturn as it is deployed. It confirms that coturn
+answers STUN, that the shared secret is not visible in its process
+arguments, that two relayed clients can reach each other, and that private
+addresses are refused. CI runs the same check.
+
 To keep a server private, set `DOOMMSG_REGISTRATION_CODE`. New accounts then
 need that invitation code.
 
