@@ -28,7 +28,7 @@ pre-production for high-risk use.
 | Identity | Impersonation by the server | Safety numbers, plus warnings when a key changes |
 | Local data at rest | Disk theft, copied browser profiles | AES-256-GCM under a non-extractable WebCrypto key, with the record id bound as AAD |
 | Login | Credential theft and replay | No passwords. Single-use, 2-minute challenges signed with the Ed25519 identity key. Only token hashes are stored server-side, and tokens are never persisted on the client |
-| TURN abuse | SSRF and open relaying | Short-lived HMAC credentials, peers denied for private, loopback and link-local ranges, quotas |
+| TURN abuse | SSRF and open relaying | Short-lived HMAC credentials, peers denied for private, loopback and link-local ranges (except coturn's own relay address, so two relayed clients can reach each other), quotas |
 | Web client | XSS | Strict CSP with no inline script or style, Trusted Types (`'none'`), no `innerHTML` (enforced by lint), React escaping. Messages are always rendered as text |
 
 ### What is *not* protected (known limitations)

@@ -66,12 +66,28 @@ services:
     image: ${COTURN_IMAGE:-coturn/coturn:4.6-alpine}
     cap_add: ["NET_BIND_SERVICE"]
     read_only: true
-    command:
+    environment:
+      TURN_SECRET: ${DOOMMSG_TURN_SECRET:?set DOOMMSG_TURN_SECRET in .env}
+    # The secret is written into a config file on the tmpfs rather than passed
+    # as a flag, so it never shows up in the host's process list. It is also
+    # dropped from the environment that turnserver inherits. ($$ leaves the
+    # expansion to the container's shell.)
+    entrypoint:
+      - /bin/sh
       - -c
-      - /etc/coturn/turnserver.conf
-      - --static-auth-secret=${DOOMMSG_TURN_SECRET}
+      - |
+        set -eu
+        umask 077
+        { cat /etc/coturn/turnserver.conf; printf '\nstatic-auth-secret=%s\n' "$$TURN_SECRET"; } > /tmp/turnserver.conf
+        unset TURN_SECRET
+        exec turnserver -c /tmp/turnserver.conf "$$@"
+      - turnserver
+    command:
       - --realm=${DOOMMSG_DOMAIN}
-      - --external-ip=${TURN_EXTERNAL_IP:?set TURN_EXTERNAL_IP (server public IP) in .env}
+      # public/private form: coturn maps its public relay addresses back to
+      # its own (pinned) bridge address, so two relayed clients can reach
+      # each other. See allowed-peer-ip in turnserver.conf.
+      - --external-ip=${TURN_EXTERNAL_IP:?set TURN_EXTERNAL_IP (server public IP) in .env}/172.30.0.10
     volumes:
       - ./coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
     tmpfs: ["/var/lib/coturn", "/tmp"]
@@ -79,12 +95,20 @@ services:
       - "3478:3478/udp"
       - "3478:3478/tcp"
       - "49160-49200:49160-49200/udp"
-    networks: [public]
+    networks:
+      public:
+        ipv4_address: 172.30.0.10
 
 networks:
   internal:
     internal: true
-  public: {}
+  public:
+    ipam:
+      config:
+        # coturn is pinned to 172.30.0.10; other containers are given
+        # addresses from the upper half so they can never take it.
+        - subnet: 172.30.0.0/24
+          ip_range: 172.30.0.128/25
 
 volumes:
   server-data:

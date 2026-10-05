@@ -5,7 +5,8 @@ import { join } from 'node:path';
 // The e2e suite runs the real Go relay and the production build of the web
 // client, then drives two independent browser profiles against them.
 const db = join(tmpdir(), `doommsg-e2e-${process.pid}.db`);
-const server = process.env.DOOMMSG_SERVER_BIN ?? 'go run ../server/cmd/doommsg-server';
+// webServer commands run from web/, which is outside the Go module: -C enters it.
+const server = process.env.DOOMMSG_SERVER_BIN ?? 'go -C ../server run ./cmd/doommsg-server';
 
 export default defineConfig({
   testDir: './e2e',

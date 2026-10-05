@@ -93,6 +93,13 @@ docker compose up -d --build
 Open these ports: `80/tcp` and `443/tcp+udp` for Caddy (automatic Let's
 Encrypt certificates), and `3478/tcp+udp` plus `49160-49200/udp` for TURN.
 
+coturn is pinned to `172.30.0.10` on a `172.30.0.0/24` bridge network. That
+lets it relay between two relayed clients through its own address while it
+still refuses every other private address. If the subnet clashes with one
+already in use on the host, change it in `docker-compose.yml` (the network,
+coturn's address and the `--external-ip` suffix) and in `allowed-peer-ip` in
+`coturn/turnserver.conf`.
+
 To keep a server private, set `DOOMMSG_REGISTRATION_CODE`. New accounts then
 need that invitation code.
 

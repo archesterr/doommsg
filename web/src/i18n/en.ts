@@ -157,6 +157,7 @@ export const en = {
   'call.err.media': 'Camera or microphone is unavailable',
   'call.err.offline': 'Contact is offline right now',
   'call.err.failed': 'Call could not be connected',
+  'call.err.relay': 'The call relay is unavailable. To keep your IP address private, the call was not connected.',
 
   'elsewhere.title': 'DoomMsg is open in another tab',
   'elsewhere.body': 'To keep your encryption keys consistent, only one tab can be active at a time.',

@@ -45,6 +45,15 @@ export const useCall = create<CallState>(() => idle);
 const RING_TIMEOUT = 45_000;
 const DISCONNECT_GRACE = 8_000;
 
+/** "Always relay calls" is on, but there are no TURN credentials to relay with. */
+class RelayUnavailableError extends Error {}
+
+/** Stops a stream's tracks and closes a peer connection; both are idempotent. */
+function release(stream?: MediaStream, pc?: RTCPeerConnection): void {
+  stream?.getTracks().forEach((t) => t.stop());
+  pc?.close();
+}
+
 const audioConstraints: MediaTrackConstraints = {
   echoCancellation: true,
   noiseSuppression: true,
@@ -70,6 +79,11 @@ class CallManager {
   private restarted = false;
   private facing: 'user' | 'environment' = 'user';
   private statsTimer: ReturnType<typeof setInterval> | null = null;
+  /**
+   * Bumped by reset(). Async steps capture it before they await and give up,
+   * releasing whatever they acquired, once the call they belong to is over.
+   */
+  private gen = 0;
 
   constructor() {
     messenger.onCallSignal((from, sig) => void this.onSignal(from, sig));
@@ -83,6 +97,10 @@ class CallManager {
 
   private set(p: Partial<CallState>) {
     useCall.setState(p);
+  }
+
+  private ended(gen: number): boolean {
+    return gen !== this.gen;
   }
 
   private async iceServers(): Promise<RTCIceServer[]> {
@@ -103,12 +121,13 @@ class CallManager {
     });
   }
 
-  private async createPeer(peer: string, callId: string, polite: boolean): Promise<RTCPeerConnection> {
-    const iceServers = await this.iceServers();
-    const relay = useApp.getState().settings.relayCalls && iceServers.some((s) => s.username);
+  private createPeer(peer: string, callId: string, polite: boolean, iceServers: RTCIceServer[]): RTCPeerConnection {
+    const { relayCalls } = useApp.getState().settings;
+    // Never fall back to direct candidates, which would reveal our IP address.
+    if (relayCalls && !iceServers.some((s) => s.username)) throw new RelayUnavailableError();
     const pc = new RTCPeerConnection({
       iceServers,
-      iceTransportPolicy: relay ? 'relay' : 'all',
+      iceTransportPolicy: relayCalls ? 'relay' : 'all',
       bundlePolicy: 'max-bundle',
       rtcpMuxPolicy: 'require',
     });
@@ -171,6 +190,10 @@ class CallManager {
   private recover() {
     const pc = this.pc;
     if (!pc) return;
+    // A grace timer still pending here must not fire later and end the call
+    // once the ICE restart below has recovered it.
+    if (this.disconnectTimer) clearTimeout(this.disconnectTimer);
+    this.disconnectTimer = null;
     if (!this.restarted) {
       this.restarted = true;
       this.set({ quality: 'reconnecting' });
@@ -187,7 +210,8 @@ class CallManager {
     this.statsTimer = setInterval(async () => {
       const pc = this.pc;
       if (!pc) return;
-      const stats = await pc.getStats();
+      const stats = await pc.getStats().catch(() => null);
+      if (!stats || pc !== this.pc) return;
       let rtt = 0;
       let lost = 0;
       let received = 0;
@@ -213,10 +237,25 @@ class CallManager {
     for (const c of queued) await pc.addIceCandidate(c).catch(() => {});
   }
 
+  /** Arms the ring timeout, replacing any earlier one; it only acts on `callId`. */
+  private armRing(callId: string, ms: number, onTimeout: () => void) {
+    this.clearRing();
+    this.ringTimer = setTimeout(() => {
+      this.ringTimer = null;
+      if (useCall.getState().callId === callId) onTimeout();
+    }, ms);
+  }
+
+  private clearRing() {
+    if (this.ringTimer) clearTimeout(this.ringTimer);
+    this.ringTimer = null;
+  }
+
   // ---- public API --------------------------------------------------------
 
   async start(peer: string, video: boolean): Promise<void> {
     if (useCall.getState().phase !== 'idle') return;
+    const gen = this.gen;
     const callId = crypto.randomUUID();
     this.restarted = false;
     this.set({ ...idle, phase: 'outgoing', peer, callId, video, dir: 'out' });
@@ -224,54 +263,91 @@ class CallManager {
     try {
       local = await this.media(video);
     } catch {
+      if (this.ended(gen)) return;
       toast('call.err.media', 'error');
       this.reset();
       return;
     }
+    if (this.ended(gen)) return release(local);
     this.set({ local });
+    let pc: RTCPeerConnection | undefined;
     try {
-      const pc = await this.createPeer(peer, callId, false);
-      local.getTracks().forEach((t) => pc.addTrack(t, local));
+      const iceServers = await this.iceServers();
+      if (this.ended(gen)) return release(local);
+      pc = this.createPeer(peer, callId, false, iceServers);
+      for (const t of local.getTracks()) pc.addTrack(t, local);
       await pc.setLocalDescription(await pc.createOffer());
+      if (this.ended(gen)) return release(local, pc);
       await messenger.sendCallSignal(peer, { op: 'offer', callId, sdp: pc.localDescription!.sdp, video });
     } catch (e) {
-      toast(messenger.isSendError(e, 'offline') ? 'call.err.offline' : 'call.err.failed', 'error');
-      await messenger.recordCall(peer, 'out', { video, outcome: 'failed' });
+      if (this.ended(gen)) return release(local, pc);
+      toast(
+        e instanceof RelayUnavailableError
+          ? 'call.err.relay'
+          : messenger.isSendError(e, 'offline')
+            ? 'call.err.offline'
+            : 'call.err.failed',
+        'error',
+      );
       this.reset();
+      await messenger.recordCall(peer, 'out', { video, outcome: 'failed' });
       return;
     }
+    // Hung up, or already answered, while the offer was on its way.
+    if (this.ended(gen)) return release(local, pc);
+    if (useCall.getState().phase !== 'outgoing') return;
     playRingback();
-    this.ringTimer = setTimeout(() => void this.finish('cancelled', true), RING_TIMEOUT);
+    this.armRing(callId, RING_TIMEOUT, () => void this.finish('cancelled', true));
   }
 
   async accept(): Promise<void> {
     const s = useCall.getState();
     if (s.phase !== 'incoming' || !s.peer || !s.callId || !this.pendingOffer) return;
+    const gen = this.gen;
     stopTone();
-    if (this.ringTimer) clearTimeout(this.ringTimer);
+    this.clearRing();
     const { peer, callId } = s;
     const offer = this.pendingOffer;
     this.set({ phase: 'connecting' });
-    let local: MediaStream;
+    let local: MediaStream | undefined;
+    let cameraOff = false;
     try {
       local = await this.media(offer.video);
     } catch {
+      // No usable camera (missing, busy or blocked): answer a video call with
+      // audio only. Its video m-line is then answered recvonly, and the camera
+      // can still be turned on later.
+      if (offer.video && !this.ended(gen)) {
+        local = await this.media(false).catch(() => undefined);
+        cameraOff = true;
+      }
+    }
+    if (this.ended(gen)) return release(local);
+    if (!local) {
       toast('call.err.media', 'error');
       await this.finish('failed', true);
       return;
     }
-    this.set({ local });
+    this.set({ local, cameraOff });
+    let pc: RTCPeerConnection | undefined;
     try {
-      const pc = await this.createPeer(peer, callId, true);
+      const iceServers = await this.iceServers();
+      if (this.ended(gen)) return release(local);
+      pc = this.createPeer(peer, callId, true, iceServers);
       // Apply the offer first so our tracks reuse its transceivers instead
       // of creating new ones that would force a renegotiation.
       await pc.setRemoteDescription({ type: 'offer', sdp: offer.sdp });
-      local.getTracks().forEach((t) => pc.addTrack(t, local));
+      if (this.ended(gen)) return release(local, pc);
+      for (const t of local.getTracks()) pc.addTrack(t, local);
       await pc.setLocalDescription(await pc.createAnswer());
+      if (this.ended(gen)) return release(local, pc);
       await messenger.sendCallSignal(peer, { op: 'answer', callId, sdp: pc.localDescription!.sdp });
+      if (this.ended(gen)) return release(local, pc);
       await this.flushCandidates();
     } catch (e) {
+      if (this.ended(gen)) return release(local, pc);
       console.warn('accept failed', e);
+      if (e instanceof RelayUnavailableError) toast('call.err.relay', 'error');
       await this.finish('failed', true);
     }
   }
@@ -280,8 +356,8 @@ class CallManager {
     const s = useCall.getState();
     if (s.phase !== 'incoming' || !s.peer || !s.callId) return;
     void messenger.sendCallSignal(s.peer, { op: 'decline', callId: s.callId }).catch(() => {});
-    await messenger.recordCall(s.peer, 'in', { video: s.video, outcome: 'declined' });
     this.reset();
+    await messenger.recordCall(s.peer, 'in', { video: s.video, outcome: 'declined' });
   }
 
   async hangup(): Promise<void> {
@@ -310,33 +386,45 @@ class CallManager {
       return;
     }
     // Upgrade a voice call to video: add a track and renegotiate.
+    const gen = this.gen;
+    let cam: MediaStream | undefined;
     try {
-      const cam = await navigator.mediaDevices.getUserMedia({ video: videoConstraints(this.facing) });
+      cam = await navigator.mediaDevices.getUserMedia({ video: videoConstraints(this.facing) });
+      // The call may have ended, or the camera come on, while we waited.
+      const local = useCall.getState().local;
+      if (this.ended(gen) || !local || local.getVideoTracks().length) return release(cam);
       const vt = cam.getVideoTracks()[0];
-      s.local.addTrack(vt);
-      pc.addTrack(vt, s.local);
-      this.set({ video: true, cameraOff: false, local: new MediaStream(s.local.getTracks()) });
+      pc.addTrack(vt, local);
+      local.addTrack(vt);
+      this.set({ video: true, cameraOff: false, local: new MediaStream(local.getTracks()) });
     } catch {
-      toast('call.err.media', 'error');
+      release(cam);
+      if (!this.ended(gen)) toast('call.err.media', 'error');
     }
   }
 
   async switchCamera(): Promise<void> {
     const s = useCall.getState();
     const old = s.local?.getVideoTracks()[0];
-    if (!old || !this.pc || !s.local) return;
-    this.facing = this.facing === 'user' ? 'environment' : 'user';
+    const pc = this.pc;
+    if (!old || !pc || !s.local) return;
+    const gen = this.gen;
+    const facing = this.facing === 'user' ? 'environment' : 'user';
+    let cam: MediaStream | undefined;
     try {
-      const cam = await navigator.mediaDevices.getUserMedia({ video: videoConstraints(this.facing) });
+      cam = await navigator.mediaDevices.getUserMedia({ video: videoConstraints(facing) });
+      if (this.ended(gen)) return release(cam);
       const vt = cam.getVideoTracks()[0];
-      const sender = this.pc.getSenders().find((x) => x.track === old);
-      await sender?.replaceTrack(vt);
+      await pc.getSenders().find((x) => x.track === old)?.replaceTrack(vt);
+      if (this.ended(gen)) return release(cam);
+      this.facing = facing;
       s.local.removeTrack(old);
       old.stop();
       s.local.addTrack(vt);
       this.set({ local: new MediaStream(s.local.getTracks()) });
     } catch {
-      toast('call.err.media', 'error');
+      release(cam);
+      if (!this.ended(gen)) toast('call.err.media', 'error');
     }
   }
 
@@ -348,7 +436,15 @@ class CallManager {
 
     switch (sig.op) {
       case 'offer': {
-        if (s.phase !== 'idle') {
+        if (s.phase === 'outgoing' && s.peer === from && s.callId && !mine) {
+          // Glare: we called each other at the same moment. Both sides keep
+          // the call with the smaller id, so exactly one of them survives.
+          if (sig.callId > s.callId) return; // ours wins: the peer yields
+          // Theirs wins: withdraw ours quietly (the peer ignores it; the hangup
+          // only matters if its own call ended meanwhile) and ring for theirs.
+          void messenger.sendCallSignal(from, { op: 'hangup', callId: s.callId }).catch(() => {});
+          this.reset();
+        } else if (s.phase !== 'idle') {
           if (!mine) {
             void messenger.sendCallSignal(from, { op: 'busy', callId: sig.callId }).catch(() => {});
             await messenger.recordCall(from, 'in', { video: sig.video, outcome: 'missed' });
@@ -363,30 +459,31 @@ class CallManager {
         void messenger.sendCallSignal(from, { op: 'ringing', callId: sig.callId }).catch(() => {});
         playRingtone();
         this.notifyIncoming(from, sig.video);
-        this.ringTimer = setTimeout(async () => {
-          if (useCall.getState().phase === 'incoming' && useCall.getState().callId === sig.callId) {
-            await messenger.recordCall(from, 'in', { video: sig.video, outcome: 'missed' });
-            this.reset();
-          }
-        }, RING_TIMEOUT + 5000);
+        this.armRing(sig.callId, RING_TIMEOUT + 5000, () => {
+          if (useCall.getState().phase === 'incoming') void this.missed(from, sig.video);
+        });
         return;
       }
       case 'ringing':
         if (mine && s.phase === 'outgoing') this.set({ ringing: true });
         return;
-      case 'answer':
-        if (!mine || s.phase !== 'outgoing' || !this.pc) return;
-        if (this.ringTimer) clearTimeout(this.ringTimer);
+      case 'answer': {
+        const pc = this.pc;
+        if (!mine || s.phase !== 'outgoing' || !pc) return;
+        const gen = this.gen;
+        this.clearRing();
         stopTone();
         this.set({ phase: 'connecting' });
         try {
-          await this.pc.setRemoteDescription({ type: 'answer', sdp: sig.sdp });
-          await this.flushCandidates();
+          await pc.setRemoteDescription({ type: 'answer', sdp: sig.sdp });
+          if (!this.ended(gen)) await this.flushCandidates();
         } catch (e) {
+          if (this.ended(gen)) return;
           console.warn('bad answer', e);
           await this.finish('failed', true);
         }
         return;
+      }
       case 'ice':
         if (!mine) return;
         if (this.pc?.remoteDescription) await this.pc.addIceCandidate(sig.candidate).catch(() => {});
@@ -412,12 +509,8 @@ class CallManager {
         return;
       case 'hangup':
         if (!mine) return;
-        if (s.phase === 'incoming') {
-          await messenger.recordCall(from, 'in', { video: s.video, outcome: 'missed' });
-          this.reset();
-        } else {
-          await this.finish(s.phase === 'active' ? 'completed' : 'cancelled', false);
-        }
+        if (s.phase === 'incoming') await this.missed(from, s.video);
+        else await this.finish(s.phase === 'active' ? 'completed' : 'cancelled', false);
         return;
       case 'decline':
       case 'busy':
@@ -429,9 +522,9 @@ class CallManager {
   }
 
   private notifyIncoming(from: string, video: boolean) {
-    if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+    const { notifications, lang } = useApp.getState().settings;
+    if (!notifications || typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
     if (document.visibilityState === 'visible') return;
-    const lang = useApp.getState().settings.lang;
     const n = new Notification(`@${from}`, {
       body: lang === 'fa' ? (video ? 'تماس تصویری ورودی' : 'تماس صوتی ورودی') : video ? 'Incoming video call' : 'Incoming voice call',
       tag: 'call',
@@ -451,12 +544,21 @@ class CallManager {
     }
     const durationSec = s.startedAt ? Math.round((Date.now() - s.startedAt) / 1000) : undefined;
     const final = s.startedAt && outcome !== 'failed' ? 'completed' : outcome;
-    await messenger.recordCall(s.peer, s.dir ?? 'out', { video: s.video, outcome: final, durationSec });
+    // Tear down before the async log write, so nothing can end (and log) this
+    // call a second time, or reset a newer one, while the write is pending.
     this.reset();
     playEndTone();
+    await messenger.recordCall(s.peer, s.dir ?? 'out', { video: s.video, outcome: final, durationSec });
+  }
+
+  /** Ends an unanswered incoming call and logs it as missed. */
+  private async missed(peer: string, video: boolean): Promise<void> {
+    this.reset();
+    await messenger.recordCall(peer, 'in', { video, outcome: 'missed' });
   }
 
   private reset() {
+    this.gen++;
     stopTone();
     for (const t of [this.ringTimer, this.disconnectTimer]) if (t) clearTimeout(t);
     if (this.statsTimer) clearInterval(this.statsTimer);

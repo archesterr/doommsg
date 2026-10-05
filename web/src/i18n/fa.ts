@@ -159,6 +159,7 @@ export const fa: Record<MessageKey, string> = {
   'call.err.media': 'دوربین یا میکروفون در دسترس نیست',
   'call.err.offline': 'مخاطب در حال حاضر آفلاین است',
   'call.err.failed': 'برقراری تماس ممکن نشد',
+  'call.err.relay': 'رلهٔ تماس در دسترس نیست. برای محافظت از نشانی IP شما، تماس برقرار نشد.',
 
   'elsewhere.title': 'DoomMsg در زبانهٔ دیگری باز است',
   'elsewhere.body': 'برای یکپارچه ماندن کلیدهای رمزنگاری، در هر لحظه فقط یک زبانه می‌تواند فعال باشد.',
