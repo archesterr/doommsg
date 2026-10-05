@@ -47,6 +47,14 @@ authenticated. A session is never promoted if it is bound to a different
 identity than the current one. A prekey message whose base key belongs to an
 existing session is rejected as a replay.
 
+Deleting a chat removes its history and the contact, but keeps the ratchet
+session, which the peer is still using. If the peer writes again, their
+message is checked against the directory as a first contact and the chat
+comes back. A blocked contact is kept, hidden from the chat list, so that
+deleting the chat doesn't lift the block. The client only sends on a session
+bound to the contact's pinned key. If the contact is added again with a
+different key, a new session is started; the old one is not re-trusted.
+
 ## Double Ratchet
 
 - `KDF_RK`: `HKDF(salt=RK, ikm=DH_out, info="DoomMsg/v1/ratchet") → RK', CK`
@@ -88,7 +96,9 @@ Before encryption, plaintext is JSON padded to 256-byte buckets:
   tenth of a mailbox, so one account cannot lock everyone else out of it.
 - On reconnect, the backlog drains alongside the read loop at the speed the
   client reads it. Acks are applied while the backlog is still being sent,
-  and `synced` follows the last queued envelope.
+  and `synced` follows the last envelope that was queued when the
+  connection registered. Envelopes queued after that are delivered live,
+  and the backlog doesn't send them again.
 - Ephemeral envelopes are delivered only to online recipients and are never
   written to disk. A send to an offline user fails with `offline`.
 - Each account has one live connection. A newer connection replaces the
