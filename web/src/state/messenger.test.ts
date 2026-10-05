@@ -241,6 +241,34 @@ describe('acks and receipts (#9)', () => {
     ]);
   });
 
+  it('recognises a backlog sent again after a reconnect, however large', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const h = harness({ fakeCipher: true });
+    setContact(contact('bob'));
+    const decrypt = h.x.cipher.decrypt as ReturnType<typeof vi.fn>;
+    const n = 1300; // more than the 1000 ids kept in storage
+    for (let sid = 1; sid <= n; sid++) h.deliver({ sid, from: 'bob', payload: text(`m${sid}`) });
+    await h.idle();
+    expect(decrypt).toHaveBeenCalledTimes(n);
+
+    // The acks were lost with the connection: the server sends 201.. again.
+    for (let sid = 201; sid <= n; sid++) h.deliver({ sid, from: 'bob', payload: text(`m${sid}`) });
+    await h.idle();
+    expect(decrypt).toHaveBeenCalledTimes(n); // none decrypted twice
+    expect(h.acks.flat().filter((sid) => sid > 200)).toHaveLength(2 * (n - 200));
+  }, 60_000);
+
+  it('processes an envelope sent again while its first copy is still queued only once', async () => {
+    const h = harness({ fakeCipher: true });
+    setContact(contact('bob'));
+    const decrypt = h.x.cipher.decrypt as ReturnType<typeof vi.fn>;
+    for (const sid of [1, 2, 3]) h.deliver({ sid, from: 'bob', payload: text(`m${sid}`) });
+    for (const sid of [1, 2, 3]) h.deliver({ sid, from: 'bob', payload: text(`m${sid}`) });
+    await h.idle();
+    expect(decrypt).toHaveBeenCalledTimes(3);
+    expect([...new Set(h.acks.flat())].sort()).toEqual([1, 2, 3]);
+  });
+
   it('keeps processing envelopes when an ack cannot be sent', async () => {
     const h = harness({ fakeCipher: true });
     setContact(contact('bob'));

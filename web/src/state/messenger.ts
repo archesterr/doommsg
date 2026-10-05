@@ -50,6 +50,14 @@ const MAX_ACK_IDS = 500;
 const RECEIPT_DELAY = 1000;
 /** Message ids per receipt; a receiver honours no more. */
 const MAX_RECEIPT_IDS = 500;
+/** Envelope ids kept in storage, to recognise redeliveries after a reload. */
+const SEEN_STORED = 1000;
+/**
+ * Envelope ids remembered while the page is open. A reconnect re-sends
+ * every unacknowledged envelope, and one mailbox flush can hold far more
+ * than SEEN_STORED (DOOMMSG_MAILBOX_MAX, 10 000 by default).
+ */
+const SEEN_IN_MEMORY = 50_000;
 /** Local retries of an envelope that could not be processed for a transient reason. */
 const RETRY_DELAYS = [2_000, 5_000, 15_000, 30_000, 60_000];
 
@@ -101,6 +109,8 @@ export class Messenger {
   private stopped = false;
   private seenSids = new Set<number>();
   private seenOrder: number[] = [];
+  /** Envelopes handled since the page loaded, oldest first (up to SEEN_IN_MEMORY). */
+  private handledSids = new Set<number>();
   private inbound: Promise<void> = Promise.resolve();
   /** Envelopes handed to `inbound` and not yet processed. */
   private queued = 0;
@@ -435,9 +445,15 @@ export class Messenger {
     const unreadIn = (useApp.getState().messages[peer] ?? []).filter(
       (m) => m.dir === 'in' && m.kind === 'text' && m.status !== 'read',
     );
-    if (!unreadIn.length) return;
-    for (const m of unreadIn) await this.saveMessage({ ...m, status: 'read' });
-    if (useApp.getState().settings.readReceipts) this.queueReceipt(peer, 'read', unreadIn.map((m) => m.id));
+    const read: string[] = [];
+    for (const m of unreadIn) {
+      // The stored copy: a message deleted meanwhile must not be written back.
+      const cur = await db.getMessage<ChatMessage>(m.id);
+      if (!cur) continue;
+      await this.saveMessage({ ...cur, status: 'read' });
+      read.push(m.id);
+    }
+    if (read.length && useApp.getState().settings.readReceipts) this.queueReceipt(peer, 'read', read);
   }
 
   private async saveMessage(m: ChatMessage): Promise<void> {
@@ -608,9 +624,11 @@ export class Messenger {
   // ---- receiving ----------------------------------------------------------
 
   private async markSeen(sid: number): Promise<void> {
+    this.handledSids.add(sid);
+    if (this.handledSids.size > SEEN_IN_MEMORY) this.handledSids.delete(this.handledSids.values().next().value!);
     this.seenSids.add(sid);
     this.seenOrder.push(sid);
-    if (this.seenOrder.length > 1000) this.seenSids.delete(this.seenOrder.shift()!);
+    if (this.seenOrder.length > SEEN_STORED) this.seenSids.delete(this.seenOrder.shift()!);
     await db.put('kv', 'seenSids', this.seenOrder);
   }
 
@@ -629,7 +647,7 @@ export class Messenger {
   private async handleInbound(m: InboundMessage, attempt: number): Promise<void> {
     // Another tab owns the sessions now; it gets this envelope from the server.
     if (this.stopped) return;
-    if (m.sid !== undefined && this.seenSids.has(m.sid)) {
+    if (m.sid !== undefined && (this.seenSids.has(m.sid) || this.handledSids.has(m.sid))) {
       // Redelivered because its ack never arrived: acknowledge it again.
       this.queueAck(m.sid);
       return;
@@ -787,7 +805,7 @@ export class Messenger {
       case 'receipt': {
         const rank = { pending: 0, failed: 0, sent: 1, delivered: 2, read: 3 } as const;
         for (const id of (c.ids ?? []).slice(0, 500)) {
-          const existing = useApp.getState().messages[peer]?.find((x) => x.id === id) ?? (await db.getMessage<ChatMessage>(id));
+          const existing = await db.getMessage<ChatMessage>(id); // never write back a deleted one
           if (!existing || existing.peer !== peer || existing.dir !== 'out') continue;
           if (rank[c.s] > rank[existing.status]) await this.saveMessage({ ...existing, status: c.s });
         }
