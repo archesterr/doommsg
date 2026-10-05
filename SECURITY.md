@@ -70,6 +70,14 @@ pre-production for high-risk use.
 - At most 1000 skipped message keys per step and 2000 stored.
   Decryption is transactional, so a forged message can never corrupt
   session state.
+- A peer's claimed identity is trusted only after its first message
+  decrypts, and every later send and receive is checked against the pinned
+  key. A replayed prekey message is rejected while the session it created is
+  still among the last four kept for that contact. As in X3DH, a replay of an
+  initial message sent without a one-time prekey is not detectable after
+  that. Such a replay can only resend an old message and briefly switch the
+  conversation to a stale session, which recovers with the peer's next
+  message. It never reveals plaintext or keys.
 - Every signature carries a domain-separation prefix, and the server checks
   each one. The prefixes are defined in `server/internal/api/api.go` and
   `web/src/crypto/protocol.ts`.

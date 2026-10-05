@@ -119,6 +119,7 @@ need that invitation code.
 | `DOOMMSG_SESSION_TTL` | `720h` | Session token lifetime |
 | `DOOMMSG_MAILBOX_TTL` | `720h` | How long undelivered envelopes are kept |
 | `DOOMMSG_MAILBOX_MAX` | `10000` | Queued envelopes per recipient |
+| `DOOMMSG_MAILBOX_MAX_BYTES` | `67108864` (64 MiB) | Queued payload bytes per recipient (at least 1 MiB). Each sender may use a tenth of this and of `DOOMMSG_MAILBOX_MAX` |
 | `DOOMMSG_LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 
 **Endpoints:** `GET /healthz` (liveness), `GET /readyz` (checks the
