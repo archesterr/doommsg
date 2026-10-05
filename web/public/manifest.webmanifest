@@ -1,0 +1,13 @@
+{
+  "name": "DoomMsg",
+  "short_name": "DoomMsg",
+  "description": "Private, end-to-end encrypted messaging and calls.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#0c0a12",
+  "theme_color": "#0c0a12",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

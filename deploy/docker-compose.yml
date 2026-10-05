@@ -1,0 +1,123 @@
+# DoomMsg production stack: Caddy (TLS + static client) -> relay server,
+# plus coturn for calls behind NAT. Copy .env.example to .env first.
+name: doommsg
+
+x-hardening: &hardening
+  restart: unless-stopped
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: ["ALL"]
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+
+services:
+  server:
+    <<: *hardening
+    build:
+      context: ../server
+      args:
+        GO_IMAGE: ${GO_IMAGE:-golang:1.26-alpine}
+        RUNTIME_IMAGE: ${RUNTIME_IMAGE:-gcr.io/distroless/static-debian12:nonroot}
+        GOPROXY: ${GOPROXY:-https://proxy.golang.org,direct}
+    image: ${REGISTRY_PREFIX:-}doommsg-server:${TAG:-latest}
+    read_only: true
+    environment:
+      DOOMMSG_TRUST_PROXY: "true"
+      DOOMMSG_REGISTRATION_CODE: ${DOOMMSG_REGISTRATION_CODE:-}
+      DOOMMSG_TURN_SECRET: ${DOOMMSG_TURN_SECRET:?set DOOMMSG_TURN_SECRET in .env}
+      DOOMMSG_TURN_URLS: turn:${DOOMMSG_DOMAIN}:3478?transport=udp,turn:${DOOMMSG_DOMAIN}:3478?transport=tcp
+      DOOMMSG_STUN_URLS: stun:${DOOMMSG_DOMAIN}:3478
+      DOOMMSG_LOG_LEVEL: ${DOOMMSG_LOG_LEVEL:-info}
+    volumes:
+      - server-data:/data
+    expose: ["8080"]
+    # Prometheus metrics on :9090 stay on the internal network.
+    networks: [internal]
+
+  web:
+    <<: *hardening
+    build:
+      context: ../web
+      args:
+        NODE_IMAGE: ${NODE_IMAGE:-node:22-alpine}
+        CADDY_IMAGE: ${CADDY_IMAGE:-caddy:2-alpine}
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org/}
+    image: ${REGISTRY_PREFIX:-}doommsg-web:${TAG:-latest}
+    cap_add: ["NET_BIND_SERVICE"]
+    read_only: true
+    environment:
+      DOOMMSG_DOMAIN: ${DOOMMSG_DOMAIN:?set DOOMMSG_DOMAIN in .env}
+      DOOMMSG_UPSTREAM: server:8080
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - caddy-data:/data
+      - caddy-config:/config
+    tmpfs: ["/tmp"]
+    depends_on:
+      server:
+        condition: service_healthy
+    networks: [internal, public]
+
+  coturn:
+    <<: *hardening
+    image: ${COTURN_IMAGE:-coturn/coturn:4.6-alpine}
+    cap_add: ["NET_BIND_SERVICE"]
+    read_only: true
+    environment:
+      TURN_SECRET: ${DOOMMSG_TURN_SECRET:?set DOOMMSG_TURN_SECRET in .env}
+    # The secret is written into a config file on the tmpfs rather than passed
+    # as a flag, so it never shows up in the host's process list. It is also
+    # dropped from the environment that turnserver inherits. ($$ leaves the
+    # expansion to the container's shell.)
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        # The relay enforces the same alphabet (server/internal/config): it is
+        # what coturn's config parser reads back exactly as written.
+        case "$$TURN_SECRET" in
+          =* | *[!A-Za-z0-9+/=_.-]*)
+            echo 'DOOMMSG_TURN_SECRET may only contain letters, digits and + / = _ . - and must not start with =' >&2
+            exit 1 ;;
+        esac
+        umask 077
+        { cat /etc/coturn/turnserver.conf; printf '\nstatic-auth-secret=%s\n' "$$TURN_SECRET"; } > /tmp/turnserver.conf
+        unset TURN_SECRET
+        exec turnserver -c /tmp/turnserver.conf "$$@"
+      - turnserver
+    command:
+      - --realm=${DOOMMSG_DOMAIN}
+      # public/private form: coturn maps its public relay addresses back to
+      # its own (pinned) bridge address, so two relayed clients can reach
+      # each other. See allowed-peer-ip in turnserver.conf.
+      - --external-ip=${TURN_EXTERNAL_IP:?set TURN_EXTERNAL_IP (server public IP) in .env}/172.30.0.10
+    volumes:
+      - ./coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+    tmpfs: ["/var/lib/coturn", "/tmp"]
+    ports:
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+      - "49160-49200:49160-49200/udp"
+    networks:
+      public:
+        ipv4_address: 172.30.0.10
+
+networks:
+  internal:
+    internal: true
+  public:
+    ipam:
+      config:
+        # coturn is pinned to 172.30.0.10; other containers are given
+        # addresses from the upper half so they can never take it.
+        - subnet: 172.30.0.0/24
+          ip_range: 172.30.0.128/25
+
+volumes:
+  server-data:
+  caddy-data:
+  caddy-config:
