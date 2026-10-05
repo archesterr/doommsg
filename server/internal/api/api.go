@@ -98,7 +98,7 @@ func New(cfg *config.Config, st *store.Store, log *slog.Logger) *Server {
 		Store:      st,
 		Auth:       s.authenticate,
 		MailboxTTL: cfg.MailboxTTL,
-		MailboxMax: cfg.MailboxMax,
+		Mailbox:    store.MailboxLimits{Max: cfg.MailboxMax, MaxBytes: int64(cfg.MailboxMaxBytes)},
 		Logger:     log,
 	})
 	return s
@@ -247,20 +247,25 @@ func (s *Server) authed(h http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		hash := hashToken(raw)
-		id, name, err := s.store.SessionUser(r.Context(), hash)
+		sess, err := s.store.SessionUser(r.Context(), hash)
 		if err != nil {
 			writeErr(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
-		ctx := context.WithValue(r.Context(), ctxKey{}, principal{id: id, username: name, token: hash})
+		ctx := context.WithValue(r.Context(), ctxKey{}, principal{id: sess.UserID, username: sess.Username, token: hash})
 		h(w, r.WithContext(ctx))
 	}
 }
 
 func me(r *http.Request) principal { return r.Context().Value(ctxKey{}).(principal) }
 
-func (s *Server) authenticate(ctx context.Context, token string) (int64, string, error) {
-	return s.store.SessionUser(ctx, hashToken(token))
+func (s *Server) authenticate(ctx context.Context, token string) (hub.Session, error) {
+	hash := hashToken(token)
+	sess, err := s.store.SessionUser(ctx, hash)
+	if err != nil {
+		return hub.Session{}, err
+	}
+	return hub.Session{UserID: sess.UserID, Username: sess.Username, TokenHash: hash, ExpiresAt: sess.ExpiresAt}, nil
 }
 
 func hashToken(t string) []byte {
@@ -464,10 +469,12 @@ func (s *Server) verify(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
-	if err := s.store.DeleteSession(r.Context(), me(r).token); err != nil {
+	p := me(r)
+	if err := s.store.DeleteSession(r.Context(), p.token); err != nil {
 		s.internal(w, err)
 		return
 	}
+	s.hub.DisconnectSession(p.id, p.token)
 	w.WriteHeader(http.StatusNoContent)
 }
 

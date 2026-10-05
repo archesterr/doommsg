@@ -5,12 +5,14 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -18,28 +20,43 @@ import (
 	"github.com/coder/websocket"
 
 	"github.com/archesterr/doommsg/server/internal/config"
+	"github.com/archesterr/doommsg/server/internal/hub"
 	"github.com/archesterr/doommsg/server/internal/store"
 	"github.com/archesterr/doommsg/server/internal/validate"
 )
 
 type testEnv struct {
-	t   *testing.T
-	srv *httptest.Server
-	api *Server
+	t      *testing.T
+	srv    *httptest.Server
+	api    *Server
+	dbPath string
 }
 
 func newEnv(t *testing.T, mutate func(*config.Config)) *testEnv {
 	t.Helper()
+	return newEnvAt(t, ":memory:", mutate)
+}
+
+// newFileEnv is newEnv with a database file that tests can also open
+// directly (see openDB).
+func newFileEnv(t *testing.T, mutate func(*config.Config)) *testEnv {
+	t.Helper()
+	return newEnvAt(t, filepath.Join(t.TempDir(), "doommsg.db"), mutate)
+}
+
+func newEnvAt(t *testing.T, dbPath string, mutate func(*config.Config)) *testEnv {
+	t.Helper()
 	cfg := &config.Config{
-		SessionTTL: time.Hour,
-		MailboxTTL: time.Hour,
-		MailboxMax: 100,
-		TURNTTL:    time.Hour,
+		SessionTTL:      time.Hour,
+		MailboxTTL:      time.Hour,
+		MailboxMax:      100,
+		MailboxMaxBytes: 64 << 20,
+		TURNTTL:         time.Hour,
 	}
 	if mutate != nil {
 		mutate(cfg)
 	}
-	st, err := store.Open(context.Background(), ":memory:")
+	st, err := store.Open(context.Background(), dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,7 +64,18 @@ func newEnv(t *testing.T, mutate func(*config.Config)) *testEnv {
 	a := New(cfg, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	srv := httptest.NewServer(a.Handler())
 	t.Cleanup(func() { a.Hub().Close(); srv.Close() })
-	return &testEnv{t: t, srv: srv, api: a}
+	return &testEnv{t: t, srv: srv, api: a, dbPath: dbPath}
+}
+
+// openDB opens a second connection pool to a newFileEnv database.
+func (e *testEnv) openDB() *sql.DB {
+	e.t.Helper()
+	db, err := sql.Open("sqlite", "file:"+e.dbPath+"?_pragma=busy_timeout(10000)")
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	e.t.Cleanup(func() { db.Close() })
+	return db
 }
 
 type account struct {
@@ -290,6 +318,68 @@ func recv(t *testing.T, ws *websocket.Conn) frame {
 	return f
 }
 
+// expectClose reads until the server closes ws and checks the status.
+func expectClose(t *testing.T, ws *websocket.Conn, want websocket.StatusCode, within time.Duration) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), within)
+	defer cancel()
+	for {
+		if _, _, err := ws.Read(ctx); err != nil {
+			if got := websocket.CloseStatus(err); got != want {
+				t.Fatalf("close status %v, want %v: %v", got, want, err)
+			}
+			return
+		}
+	}
+}
+
+// fill queues n envelopes for username in a newFileEnv database and
+// returns the recipient's id. It inserts them in one transaction, since
+// going through Enqueue one by one is slow under the race detector.
+func (e *testEnv) fill(username string, n int, payload string) int64 {
+	e.t.Helper()
+	u, err := e.api.store.UserByName(context.Background(), username)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	tx, err := e.openDB().Begin()
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	defer tx.Rollback()
+	now := time.Now()
+	for range n {
+		if _, err := tx.Exec(
+			`INSERT INTO mailbox (recipient_id, sender, payload, created_at, expires_at) VALUES (?, 'alice', ?, ?, ?)`,
+			u.ID, []byte(payload), now.UnixMilli(), now.Add(time.Hour).Unix()); err != nil {
+			e.t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		e.t.Fatal(err)
+	}
+	return u.ID
+}
+
+// waitMailbox waits until the user with id uid has want queued envelopes.
+func (e *testEnv) waitMailbox(uid int64, want int) {
+	e.t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		envs, err := e.api.store.Pending(context.Background(), uid, 0, 1<<20)
+		if err != nil {
+			e.t.Fatal(err)
+		}
+		if len(envs) == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			e.t.Fatalf("mailbox holds %d envelopes, want %d", len(envs), want)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 func TestRelayStoreAndForward(t *testing.T) {
 	e := newEnv(t, nil)
 	alice := e.newAccount("alice", 0)
@@ -389,6 +479,175 @@ func TestNewConnectionReplacesOld(t *testing.T) {
 	_, _, err := first.Read(ctx)
 	if websocket.CloseStatus(err) != websocket.StatusPolicyViolation {
 		t.Fatalf("old connection not replaced: %v", err)
+	}
+}
+
+// A backlog far larger than the live send buffer drains in one connection,
+// with "synced" after the last envelope, and acks sent while it drains are
+// applied.
+func TestLargeBacklogSyncs(t *testing.T) {
+	e := newFileEnv(t, nil)
+	bob := e.newAccount("bob", 0)
+	const n = 1500
+	uid := e.fill("bob", n, strings.Repeat("A", 2000))
+
+	bw := e.dial(bob.token)
+	var got, batch []any
+	for {
+		f := recv(t, bw)
+		if f["type"] == "synced" {
+			break
+		}
+		if f["type"] != "msg" {
+			t.Fatalf("after %d envelopes: unexpected %v", len(got), f)
+		}
+		got = append(got, f["sid"])
+		if batch = append(batch, f["sid"]); len(batch) == 100 {
+			send(t, bw, frame{"type": "ack", "ids": batch})
+			batch = nil
+		}
+	}
+	if len(got) != n {
+		t.Fatalf("synced after %d of %d envelopes", len(got), n)
+	}
+	send(t, bw, frame{"type": "ack", "ids": batch})
+	e.waitMailbox(uid, 0)
+}
+
+// Acks are not charged to the send limiter: a client that acks a backlog
+// one envelope at a time, far past the send burst, loses none of them.
+func TestAcksAreNotRateLimited(t *testing.T) {
+	e := newFileEnv(t, nil)
+	bob := e.newAccount("bob", 0)
+	uid := e.fill("bob", 300, "x")
+
+	bw := e.dial(bob.token)
+	for {
+		f := recv(t, bw)
+		if f["type"] == "synced" {
+			break
+		}
+		send(t, bw, frame{"type": "ack", "ids": []any{f["sid"]}})
+	}
+	e.waitMailbox(uid, 0)
+
+	// Everything else is still limited.
+	const pings = 200
+	for range pings {
+		send(t, bw, frame{"type": "ping"})
+	}
+	limited := 0
+	for range pings {
+		if f := recv(t, bw); f["code"] == "rate_limited" {
+			limited++
+		} else if f["type"] != "pong" {
+			t.Fatalf("unexpected %v", f)
+		}
+	}
+	if limited == 0 {
+		t.Fatal("ping flood was not rate limited")
+	}
+}
+
+// A recipient who connects while a send is still waiting to commit gets
+// the envelope live once it commits; it was not in the mailbox flush.
+func TestLiveDeliveryWhileEnqueueWaits(t *testing.T) {
+	e := newFileEnv(t, nil)
+	alice := e.newAccount("alice", 0)
+	bob := e.newAccount("bob", 0)
+	aw := e.dial(alice.token)
+	recv(t, aw) // synced
+
+	// Hold the write lock so alice's send blocks inside Enqueue.
+	ctx := context.Background()
+	lock, err := e.openDB().Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	if _, err := lock.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		t.Fatal(err)
+	}
+	send(t, aw, frame{"type": "send", "id": "m1", "to": "bob", "payload": "hello"})
+	time.Sleep(300 * time.Millisecond) // until the send waits on the lock
+
+	bw := e.dial(bob.token)
+	if f := recv(t, bw); f["type"] != "synced" {
+		t.Fatalf("expected synced, got %v", f)
+	}
+	if _, err := lock.ExecContext(ctx, "ROLLBACK"); err != nil {
+		t.Fatal(err)
+	}
+	if f := recv(t, aw); f["type"] != "sent" {
+		t.Fatalf("expected sent, got %v", f)
+	}
+	if f := recv(t, bw); f["type"] != "msg" || f["payload"] != "hello" {
+		t.Fatalf("live delivery: %v", f)
+	}
+}
+
+func TestLogoutClosesThatSessionsWebSocket(t *testing.T) {
+	e := newEnv(t, nil)
+	alice := e.newAccount("alice", 0)
+	e.newAccount("bob", 0)
+	other := e.login(alice)
+	aw := e.dial(alice.token)
+	recv(t, aw) // synced
+
+	// Ending another session of the same account leaves this one alone.
+	if code, _ := e.do("POST", "/api/v1/auth/logout", other, nil); code != http.StatusNoContent {
+		t.Fatalf("logout: %d", code)
+	}
+	send(t, aw, frame{"type": "send", "id": "m1", "to": "bob", "payload": "p"})
+	if f := recv(t, aw); f["type"] != "sent" {
+		t.Fatalf("expected sent, got %v", f)
+	}
+
+	if code, _ := e.do("POST", "/api/v1/auth/logout", alice.token, nil); code != http.StatusNoContent {
+		t.Fatalf("logout: %d", code)
+	}
+	expectClose(t, aw, websocket.StatusPolicyViolation, 5*time.Second)
+}
+
+func TestSessionExpiryClosesWebSocket(t *testing.T) {
+	e := newEnv(t, func(c *config.Config) { c.SessionTTL = 3 * time.Second })
+	alice := e.newAccount("alice", 0)
+	aw := e.dial(alice.token)
+	recv(t, aw) // synced
+	expectClose(t, aw, websocket.StatusPolicyViolation, 6*time.Second)
+}
+
+// One sender cannot fill a mailbox and lock everyone else out of it.
+func TestMailboxSenderShare(t *testing.T) {
+	e := newEnv(t, nil) // MailboxMax 100: one sender may queue 10
+	alice := e.newAccount("alice", 0)
+	carol := e.newAccount("carol", 0)
+	e.newAccount("bob", 0)
+	aw := e.dial(alice.token)
+	recv(t, aw) // synced
+
+	big := strings.Repeat("A", hub.MaxPayloadBytes)
+	sent := 0
+	for i := range 100 {
+		send(t, aw, frame{"type": "send", "id": fmt.Sprint(i), "to": "bob", "payload": big})
+		f := recv(t, aw)
+		if f["code"] == "mailbox_full" {
+			break
+		}
+		if f["type"] != "sent" {
+			t.Fatalf("unexpected %v", f)
+		}
+		sent++
+	}
+	if sent != 10 {
+		t.Fatalf("one sender queued %d envelopes, want 10", sent)
+	}
+
+	cw := e.dial(carol.token)
+	recv(t, cw) // synced
+	send(t, cw, frame{"type": "send", "id": "c1", "to": "bob", "payload": "hi"})
+	if f := recv(t, cw); f["type"] != "sent" {
+		t.Fatalf("other sender locked out: %v", f)
 	}
 }
 

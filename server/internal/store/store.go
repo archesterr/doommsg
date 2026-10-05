@@ -27,6 +27,15 @@ var (
 // MaxOneTimePreKeys caps how many one-time prekeys a user may store.
 const MaxOneTimePreKeys = 500
 
+// senderShare limits one sender to 1/senderShare of a recipient's mailbox
+// (by count and by bytes), so a single account cannot fill it and lock
+// every other sender out.
+const senderShare = 10
+
+// connMaxIdleTime closes idle file-database connections. It is a variable
+// so tests can shorten it.
+var connMaxIdleTime = 5 * time.Minute
+
 type Store struct {
 	db *sql.DB
 }
@@ -64,6 +73,18 @@ type Envelope struct {
 	CreatedAt time.Time
 }
 
+type Session struct {
+	UserID    int64
+	Username  string
+	ExpiresAt time.Time
+}
+
+// MailboxLimits caps what may be queued for one recipient.
+type MailboxLimits struct {
+	Max      int   // envelopes
+	MaxBytes int64 // total payload bytes
+}
+
 // Open opens (and migrates) the database at path. Use ":memory:" in tests.
 func Open(ctx context.Context, path string) (*Store, error) {
 	q := url.Values{}
@@ -80,12 +101,13 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		return nil, err
 	}
 	if path == ":memory:" || strings.Contains(path, "mode=memory") {
-		// Every connection to :memory: is a distinct database.
+		// Every connection to :memory: is a distinct database, so the only
+		// one must never be closed: a replacement would start out empty.
 		db.SetMaxOpenConns(1)
 	} else {
 		db.SetMaxOpenConns(8)
+		db.SetConnMaxIdleTime(connMaxIdleTime)
 	}
-	db.SetConnMaxIdleTime(5 * time.Minute)
 
 	s := &Store{db: db}
 	if err := s.migrate(ctx); err != nil {
@@ -143,6 +165,9 @@ var migrations = []string{
 	);
 	CREATE INDEX mailbox_recipient ON mailbox(recipient_id, id);
 	CREATE INDEX mailbox_expiry ON mailbox(expires_at);`,
+	// Lets Enqueue add up a mailbox's usage, in total and per sender,
+	// from the index alone.
+	`CREATE INDEX mailbox_usage ON mailbox(recipient_id, sender, length(payload));`,
 }
 
 func (s *Store) migrate(ctx context.Context) error {
@@ -350,17 +375,22 @@ func (s *Store) CreateSession(ctx context.Context, tokenHash []byte, userID int6
 	return exp, err
 }
 
-// SessionUser resolves a hashed session token to its (unexpired) user.
-func (s *Store) SessionUser(ctx context.Context, tokenHash []byte) (int64, string, error) {
-	var id int64
-	var name string
+// SessionUser resolves a hashed session token to its (unexpired) session.
+func (s *Store) SessionUser(ctx context.Context, tokenHash []byte) (*Session, error) {
+	var sess Session
+	var exp int64
 	err := s.db.QueryRowContext(ctx,
-		`SELECT u.id, u.username FROM sessions s JOIN users u ON u.id = s.user_id
-		  WHERE s.token_hash = ? AND s.expires_at > ?`, tokenHash, time.Now().Unix()).Scan(&id, &name)
+		`SELECT u.id, u.username, s.expires_at FROM sessions s JOIN users u ON u.id = s.user_id
+		  WHERE s.token_hash = ? AND s.expires_at > ?`, tokenHash, time.Now().Unix()).
+		Scan(&sess.UserID, &sess.Username, &exp)
 	if errors.Is(err, sql.ErrNoRows) {
-		return 0, "", ErrNotFound
+		return nil, ErrNotFound
 	}
-	return id, name, err
+	if err != nil {
+		return nil, err
+	}
+	sess.ExpiresAt = time.Unix(exp, 0)
+	return &sess, nil
 }
 
 func (s *Store) DeleteSession(ctx context.Context, tokenHash []byte) error {
@@ -368,19 +398,36 @@ func (s *Store) DeleteSession(ctx context.Context, tokenHash []byte) error {
 	return err
 }
 
-// Enqueue stores an envelope for later delivery and returns its id.
-func (s *Store) Enqueue(ctx context.Context, recipientID int64, sender string, payload []byte, ttl time.Duration, max int) (int64, time.Time, error) {
+// mailboxUsage counts a recipient's queued envelopes and payload bytes;
+// with senderUsage appended, only those of one sender. Both are answered
+// from the mailbox_usage index.
+const (
+	mailboxUsage = `SELECT COUNT(*), COALESCE(SUM(length(payload)), 0) FROM mailbox WHERE recipient_id = ?`
+	senderUsage  = ` AND sender = ?`
+)
+
+// Enqueue stores an envelope for later delivery and returns its id. It
+// fails with ErrMailboxFul when the envelope would exceed lim, or the
+// sender's share of it.
+func (s *Store) Enqueue(ctx context.Context, recipientID int64, sender string, payload []byte, ttl time.Duration, lim MailboxLimits) (int64, time.Time, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, time.Time{}, err
 	}
 	defer tx.Rollback()
-	var n int
-	if err := tx.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM mailbox WHERE recipient_id = ?`, recipientID).Scan(&n); err != nil {
+	var n, size, nSender, sizeSender int64
+	if err := tx.QueryRowContext(ctx, mailboxUsage, recipientID).Scan(&n, &size); err != nil {
 		return 0, time.Time{}, err
 	}
-	if n >= max {
+	if err := tx.QueryRowContext(ctx, mailboxUsage+senderUsage, recipientID, sender).Scan(&nSender, &sizeSender); err != nil {
+		return 0, time.Time{}, err
+	}
+	add := int64(len(payload))
+	// A mailbox smaller than senderShare envelopes still takes one from
+	// each sender.
+	senderMax := max(int64(lim.Max)/senderShare, 1)
+	if n >= int64(lim.Max) || size+add > lim.MaxBytes ||
+		nSender >= senderMax || sizeSender+add > lim.MaxBytes/senderShare {
 		return 0, time.Time{}, ErrMailboxFul
 	}
 	now := time.Now()

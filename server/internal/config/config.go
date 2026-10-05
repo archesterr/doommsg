@@ -47,6 +47,8 @@ type Config struct {
 	MailboxTTL time.Duration
 	// MailboxMax caps queued envelopes per recipient.
 	MailboxMax int
+	// MailboxMaxBytes caps the queued payload bytes per recipient.
+	MailboxMaxBytes int
 
 	LogLevel string
 }
@@ -80,6 +82,9 @@ func Load() (*Config, error) {
 	if c.MailboxMax, err = intEnv("DOOMMSG_MAILBOX_MAX", 10000); err != nil {
 		return nil, err
 	}
+	if c.MailboxMaxBytes, err = intEnv("DOOMMSG_MAILBOX_MAX_BYTES", 64<<20); err != nil {
+		return nil, err
+	}
 
 	if len(c.TURNURLs) > 0 && c.TURNSecret == "" {
 		return nil, errors.New("DOOMMSG_TURN_URLS is set but DOOMMSG_TURN_SECRET is empty")
@@ -89,6 +94,11 @@ func Load() (*Config, error) {
 	}
 	if c.MailboxMax < 1 {
 		return nil, errors.New("DOOMMSG_MAILBOX_MAX must be positive")
+	}
+	// One sender may fill a tenth of a mailbox; that tenth must still hold
+	// the largest envelope (96 KiB).
+	if c.MailboxMaxBytes < 1<<20 {
+		return nil, errors.New("DOOMMSG_MAILBOX_MAX_BYTES must be at least 1048576 (1 MiB)")
 	}
 	return c, nil
 }

@@ -3,6 +3,7 @@
 package ratelimit
 
 import (
+	"context"
 	"sync"
 	"time"
 
@@ -29,6 +30,16 @@ func New(r rate.Limit, burst int) *Limiter {
 
 func (l *Limiter) Allow(key string) bool {
 	now := time.Now()
+	return l.get(key, now).AllowN(now, 1)
+}
+
+// Wait blocks until key may proceed, for callers that should be slowed
+// down rather than refused. It fails only when ctx ends first.
+func (l *Limiter) Wait(ctx context.Context, key string) error {
+	return l.get(key, time.Now()).Wait(ctx)
+}
+
+func (l *Limiter) get(key string, now time.Time) *rate.Limiter {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	e, ok := l.entries[key]
@@ -37,7 +48,7 @@ func (l *Limiter) Allow(key string) bool {
 		l.entries[key] = e
 	}
 	e.seen = now
-	return e.lim.AllowN(now, 1)
+	return e.lim
 }
 
 // Sweep drops keys idle for longer than the idle window. Call periodically.

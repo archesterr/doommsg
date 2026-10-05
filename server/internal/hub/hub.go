@@ -10,6 +10,7 @@
 package hub
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -38,20 +39,29 @@ const (
 	flushPage       = 200
 )
 
-// Authenticator resolves a bearer token to a user.
-type Authenticator func(ctx context.Context, token string) (userID int64, username string, err error)
+// Authenticator resolves a bearer token to its session.
+type Authenticator func(ctx context.Context, token string) (Session, error)
+
+// Session is the login a connection was authenticated with.
+type Session struct {
+	UserID    int64
+	Username  string
+	TokenHash []byte    // identifies the session to DisconnectSession
+	ExpiresAt time.Time // the connection is closed when it passes
+}
 
 type Options struct {
 	Store      *store.Store
 	Auth       Authenticator
 	MailboxTTL time.Duration
-	MailboxMax int
+	Mailbox    store.MailboxLimits
 	Logger     *slog.Logger
 }
 
 type Hub struct {
-	opt     Options
-	limiter *ratelimit.Limiter
+	opt        Options
+	limiter    *ratelimit.Limiter
+	ackLimiter *ratelimit.Limiter
 
 	mu     sync.Mutex
 	conns  map[int64]*conn
@@ -62,7 +72,10 @@ type conn struct {
 	ws       *websocket.Conn
 	userID   int64
 	username string
-	out      chan frame
+	session  []byte
+	expires  time.Time
+	out      chan frame // live frames; when it is full the client is too slow
+	backlog  chan frame // mailbox flush; unbuffered, it waits for the writer
 	cancel   context.CancelFunc
 	once     sync.Once
 }
@@ -88,27 +101,39 @@ func New(opt Options) *Hub {
 		opt: opt,
 		// Generous enough for ICE candidate bursts, tight enough to stop floods.
 		limiter: ratelimit.New(rate.Limit(20), 120),
-		conns:   make(map[int64]*conn),
+		// Acks have their own bucket: each one is capped at maxAckIDs and
+		// only deletes the caller's own envelopes.
+		ackLimiter: ratelimit.New(rate.Limit(50), 1000),
+		conns:      make(map[int64]*conn),
 	}
 }
 
 // Sweep evicts idle rate-limiter state.
-func (h *Hub) Sweep() { h.limiter.Sweep() }
+func (h *Hub) Sweep() {
+	h.limiter.Sweep()
+	h.ackLimiter.Sweep()
+}
 
-// Online reports whether a user currently has a live connection.
-func (h *Hub) Online(userID int64) bool {
+func (h *Hub) lookup(userID int64) *conn {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	_, ok := h.conns[userID]
-	return ok
+	return h.conns[userID]
 }
+
+// Online reports whether a user currently has a live connection.
+func (h *Hub) Online(userID int64) bool { return h.lookup(userID) != nil }
 
 // Disconnect closes a user's connection (e.g. after account deletion).
 func (h *Hub) Disconnect(userID int64) {
-	h.mu.Lock()
-	c := h.conns[userID]
-	h.mu.Unlock()
-	if c != nil {
+	if c := h.lookup(userID); c != nil {
+		go c.close(websocket.StatusPolicyViolation, "session ended")
+	}
+}
+
+// DisconnectSession closes a user's connection if it was authenticated
+// with the session identified by tokenHash (e.g. after logout).
+func (h *Hub) DisconnectSession(userID int64, tokenHash []byte) {
+	if c := h.lookup(userID); c != nil && bytes.Equal(c.session, tokenHash) {
 		go c.close(websocket.StatusPolicyViolation, "session ended")
 	}
 }
@@ -148,16 +173,20 @@ func (h *Hub) Accept(ctx context.Context, ws *websocket.Conn) {
 		ws.Close(websocket.StatusPolicyViolation, "auth required")
 		return
 	}
-	userID, username, err := h.opt.Auth(ctx, f.Token)
+	sess, err := h.opt.Auth(ctx, f.Token)
 	if err != nil {
 		writeJSON(ctx, ws, frame{Type: "error", Code: "unauthorized"})
 		ws.Close(websocket.StatusPolicyViolation, "unauthorized")
 		return
 	}
+	userID, username := sess.UserID, sess.Username
 
 	cctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	c := &conn{ws: ws, userID: userID, username: username, out: make(chan frame, outBuffer), cancel: cancel}
+	c := &conn{
+		ws: ws, userID: userID, username: username, session: sess.TokenHash, expires: sess.ExpiresAt,
+		out: make(chan frame, outBuffer), backlog: make(chan frame), cancel: cancel,
+	}
 
 	h.mu.Lock()
 	if h.closed {
@@ -177,6 +206,7 @@ func (h *Hub) Accept(ctx context.Context, ws *websocket.Conn) {
 	metrics.WSConnections.Inc()
 	log.Debug("ws connected")
 
+	var wg sync.WaitGroup
 	defer func() {
 		h.mu.Lock()
 		if h.conns[userID] == c {
@@ -185,22 +215,42 @@ func (h *Hub) Accept(ctx context.Context, ws *websocket.Conn) {
 		h.mu.Unlock()
 		metrics.WSConnections.Dec()
 		c.close(websocket.StatusNormalClosure, "")
+		wg.Wait()
 	}()
 
-	go c.writeLoop(cctx)
-
-	c.send(frame{Type: "ready", Username: username})
-	if err := h.flush(cctx, c); err != nil {
-		log.Warn("mailbox flush failed", "err", err)
+	// A logout between Auth and the registration above could not find this
+	// connection to close it; check the session again now that it can.
+	if _, err := h.opt.Auth(cctx, f.Token); err != nil {
+		c.close(websocket.StatusPolicyViolation, "session ended")
 		return
 	}
+
+	// Written before the writer starts, so it precedes every other frame.
+	if err := writeJSON(cctx, ws, frame{Type: "ready", Username: username}); err != nil {
+		return
+	}
+	wg.Go(func() { c.writeLoop(cctx) })
+	// The mailbox drains alongside the read loop, so acks are applied (and
+	// pongs received) while a large backlog is still being sent.
+	wg.Go(func() {
+		if err := h.flush(cctx, c); err != nil && cctx.Err() == nil {
+			log.Warn("mailbox flush failed", "err", err)
+			c.close(websocket.StatusInternalError, "sync failed")
+		}
+	})
 
 	for {
 		var in frame
 		if err := readJSON(cctx, ws, &in); err != nil {
 			return
 		}
-		if !h.limiter.Allow(username) {
+		if in.Type == "ack" {
+			// Over their bucket, acks are delayed rather than dropped: a
+			// lost ack leaves the envelope queued, to be delivered again.
+			if err := h.ackLimiter.Wait(cctx, username); err != nil {
+				return
+			}
+		} else if !h.limiter.Allow(username) {
 			metrics.RateLimited.WithLabelValues("ws").Inc()
 			c.send(frame{Type: "error", Code: "rate_limited", ID: in.ID})
 			continue
@@ -255,11 +305,8 @@ func (h *Hub) handleSend(ctx context.Context, c *conn, in frame) {
 		return
 	}
 
-	h.mu.Lock()
-	target := h.conns[rcpt.ID]
-	h.mu.Unlock()
-
 	if in.Eph {
+		target := h.lookup(rcpt.ID)
 		if target == nil {
 			fail("offline")
 			return
@@ -271,7 +318,7 @@ func (h *Hub) handleSend(ctx context.Context, c *conn, in frame) {
 		return
 	}
 
-	sid, at, err := h.opt.Store.Enqueue(ctx, rcpt.ID, c.username, []byte(in.Payload), h.opt.MailboxTTL, h.opt.MailboxMax)
+	sid, at, err := h.opt.Store.Enqueue(ctx, rcpt.ID, c.username, []byte(in.Payload), h.opt.MailboxTTL, h.opt.Mailbox)
 	if errors.Is(err, store.ErrMailboxFul) {
 		fail("mailbox_full")
 		return
@@ -283,12 +330,17 @@ func (h *Hub) handleSend(ctx context.Context, c *conn, in frame) {
 	}
 	metrics.EnvelopesRelayed.WithLabelValues(kind, "ok").Inc()
 	c.send(frame{Type: "sent", ID: in.ID, SID: sid, TS: at.UnixMilli()})
-	if target != nil {
+	// Look the recipient up only now that the envelope is committed: a
+	// connection registered before this point gets it live, and a later one
+	// finds it in its mailbox flush.
+	if target := h.lookup(rcpt.ID); target != nil {
 		target.send(frame{Type: "msg", SID: sid, From: c.username, Payload: in.Payload, TS: at.UnixMilli()})
 	}
 }
 
-// flush delivers every queued envelope to a freshly connected client.
+// flush delivers every queued envelope to a freshly connected client,
+// then "synced". The backlog waits for the writer instead of filling the
+// live buffer, so a large mailbox drains at the pace the client reads.
 // Envelopes that also arrive live during the flush are de-duplicated by
 // the client using their server id.
 func (h *Hub) flush(ctx context.Context, c *conn) error {
@@ -299,13 +351,24 @@ func (h *Hub) flush(ctx context.Context, c *conn) error {
 			return err
 		}
 		for _, e := range envs {
-			c.send(frame{Type: "msg", SID: e.ID, From: e.Sender, Payload: string(e.Payload), TS: e.CreatedAt.UnixMilli()})
+			f := frame{Type: "msg", SID: e.ID, From: e.Sender, Payload: string(e.Payload), TS: e.CreatedAt.UnixMilli()}
+			if err := c.sendBacklog(ctx, f); err != nil {
+				return err
+			}
 			after = e.ID
 		}
 		if len(envs) < flushPage {
-			c.send(frame{Type: "synced"})
-			return nil
+			return c.sendBacklog(ctx, frame{Type: "synced"})
 		}
+	}
+}
+
+func (c *conn) sendBacklog(ctx context.Context, f frame) error {
+	select {
+	case c.backlog <- f:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -322,15 +385,18 @@ func (c *conn) send(f frame) {
 func (c *conn) writeLoop(ctx context.Context) {
 	ticker := time.NewTicker(pingInterval)
 	defer ticker.Stop()
+	expiry := time.NewTimer(time.Until(c.expires))
+	defer expiry.Stop()
 	for {
+		var f frame
 		select {
 		case <-ctx.Done():
 			return
-		case f := <-c.out:
-			if err := writeJSON(ctx, c.ws, f); err != nil {
-				c.close(websocket.StatusGoingAway, "write failed")
-				return
-			}
+		case f = <-c.out:
+		case f = <-c.backlog:
+		case <-expiry.C:
+			c.close(websocket.StatusPolicyViolation, "session expired")
+			return
 		case <-ticker.C:
 			pctx, cancel := context.WithTimeout(ctx, writeTimeout)
 			err := c.ws.Ping(pctx)
@@ -339,6 +405,11 @@ func (c *conn) writeLoop(ctx context.Context) {
 				c.close(websocket.StatusGoingAway, "ping timeout")
 				return
 			}
+			continue
+		}
+		if err := writeJSON(ctx, c.ws, f); err != nil {
+			c.close(websocket.StatusGoingAway, "write failed")
+			return
 		}
 	}
 }
