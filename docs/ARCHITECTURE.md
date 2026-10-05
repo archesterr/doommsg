@@ -41,6 +41,12 @@ Alice keeps attaching the X3DH parameters (`x` below) to every message until
 Bob replies. If both sides start a session at the same time, both sessions are
 kept, and whichever one successfully decrypts gets promoted.
 
+The sender identity in `x` is not trusted on its own. Bob checks it against
+his pinned key only after the message decrypts, because only then is it
+authenticated. A session is never promoted if it is bound to a different
+identity than the current one. A prekey message whose base key belongs to an
+existing session is rejected as a replay.
+
 ## Double Ratchet
 
 - `KDF_RK`: `HKDF(salt=RK, ikm=DH_out, info="DoomMsg/v1/ratchet") → RK', CK`
@@ -77,12 +83,22 @@ Before encryption, plaintext is JSON padded to 256-byte buckets:
   deleted only when the recipient sends an `ack`, so delivery is
   at-least-once. Clients drop duplicates by the server id (`sid`, which is
   persisted before the ack) and by the message id.
+- Each mailbox is capped by envelope count (`DOOMMSG_MAILBOX_MAX`) and by
+  total bytes (`DOOMMSG_MAILBOX_MAX_BYTES`). A single sender may fill at most a
+  tenth of a mailbox, so one account cannot lock everyone else out of it.
+- On reconnect, the backlog drains alongside the read loop at the speed the
+  client reads it. Acks are applied while the backlog is still being sent,
+  and `synced` follows the last queued envelope.
 - Ephemeral envelopes are delivered only to online recipients and are never
   written to disk. A send to an offline user fails with `offline`.
 - Each account has one live connection. A newer connection replaces the
   older one, and the client uses a Web Lock so only one tab is active.
+  Logging out closes the WebSocket that used that session. A connection also
+  closes when its session expires.
 - Rate limits: per IP for HTTP, tighter limits for auth and registration,
   bundle fetches limited per requester, and WebSocket frames limited per user.
+  Acks have their own larger bucket. Acks over that limit are delayed, not
+  dropped.
 
 ## Calls
 
