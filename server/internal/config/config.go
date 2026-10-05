@@ -92,6 +92,10 @@ func Load() (*Config, error) {
 	if c.TURNSecret != "" && len(c.TURNSecret) < 32 {
 		return nil, errors.New("DOOMMSG_TURN_SECRET must be at least 32 characters")
 	}
+	if c.TURNSecret != "" && !TURNSecretOK(c.TURNSecret) {
+		return nil, errors.New("DOOMMSG_TURN_SECRET may only contain letters, digits and + / = _ . - and must not start with = " +
+			"(generate one with: openssl rand -base64 48)")
+	}
 	if c.MailboxMax < 1 {
 		return nil, errors.New("DOOMMSG_MAILBOX_MAX must be positive")
 	}
@@ -101,6 +105,23 @@ func Load() (*Config, error) {
 		return nil, errors.New("DOOMMSG_MAILBOX_MAX_BYTES must be at least 1048576 (1 MiB)")
 	}
 	return c, nil
+}
+
+// TURNSecretOK reports whether coturn reads s back from a config file
+// exactly as written. Its parser drops a leading '=', '"' or blank and
+// warns about (and logs) a trailing ';', so with such a secret the relay
+// and coturn would sign credentials with different keys. The coturn
+// entrypoint in deploy/docker-compose.yml applies the same rule.
+func TURNSecretOK(s string) bool {
+	if strings.HasPrefix(s, "=") {
+		return false
+	}
+	for _, r := range s {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("+/=_.-", r)) {
+			return false
+		}
+	}
+	return true
 }
 
 func env(key, def string) string {

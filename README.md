@@ -103,7 +103,9 @@ coturn's address and the `--external-ip` suffix) and in `allowed-peer-ip` in
 `make turn-test` checks coturn as it is deployed. It confirms that coturn
 answers STUN, that the shared secret is not visible in its process
 arguments, that two relayed clients can reach each other, and that private
-addresses are refused. CI runs the same check.
+addresses are refused. It reads coturn's address from `docker-compose.yml`,
+so it follows a subnet change, and it needs `python3` on the host. CI runs
+the same check.
 
 To keep a server private, set `DOOMMSG_REGISTRATION_CODE`. New accounts then
 need that invitation code.
@@ -118,7 +120,7 @@ need that invitation code.
 | `DOOMMSG_TRUST_PROXY` | `false` | Use the right-most `X-Forwarded-For` for rate limiting |
 | `DOOMMSG_ALLOWED_ORIGINS` | *(same-origin)* | Extra allowed browser origins |
 | `DOOMMSG_REGISTRATION_CODE` | *(open)* | Invitation code required to register |
-| `DOOMMSG_TURN_SECRET` | | coturn `static-auth-secret` (≥ 32 chars) |
+| `DOOMMSG_TURN_SECRET` | | coturn `static-auth-secret`: at least 32 characters, only letters, digits and `+ / = _ . -`, not starting with `=` |
 | `DOOMMSG_TURN_URLS` / `DOOMMSG_STUN_URLS` | | ICE servers handed to clients |
 | `DOOMMSG_TURN_TTL` | `12h` | TURN credential lifetime |
 | `DOOMMSG_SESSION_TTL` | `720h` | Session token lifetime |

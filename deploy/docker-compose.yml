@@ -77,6 +77,13 @@ services:
       - -c
       - |
         set -eu
+        # The relay enforces the same alphabet (server/internal/config): it is
+        # what coturn's config parser reads back exactly as written.
+        case "$$TURN_SECRET" in
+          =* | *[!A-Za-z0-9+/=_.-]*)
+            echo 'DOOMMSG_TURN_SECRET may only contain letters, digits and + / = _ . - and must not start with =' >&2
+            exit 1 ;;
+        esac
         umask 077
         { cat /etc/coturn/turnserver.conf; printf '\nstatic-auth-secret=%s\n' "$$TURN_SECRET"; } > /tmp/turnserver.conf
         unset TURN_SECRET
