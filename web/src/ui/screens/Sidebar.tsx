@@ -20,12 +20,14 @@ export function Sidebar({ onSettings }: { onSettings: () => void }) {
 
   const query = q.trim().replace(/^@/, '').toLowerCase();
   const list = useMemo(() => {
-    const all = Object.values(contacts).sort((a, b) => b.lastTs - a.lastTs);
+    const all = Object.values(contacts)
+      .filter((c) => !c.hidden)
+      .sort((a, b) => b.lastTs - a.lastTs);
     if (!query) return all;
     return all.filter((c) => c.username.includes(query) || c.nickname?.toLowerCase().includes(query));
   }, [contacts, query]);
 
-  const canAdd = /^[a-z0-9_]{3,32}$/.test(query) && !contacts[query];
+  const canAdd = /^[a-z0-9_]{3,32}$/.test(query) && (!contacts[query] || !!contacts[query].hidden);
 
   async function add(e?: FormEvent) {
     e?.preventDefault();

@@ -42,6 +42,11 @@ export interface Contact {
   lastPreview?: string;
   unread: number;
   blocked?: boolean;
+  /**
+   * Chat deleted while blocked: the record is kept (out of the chat list)
+   * so that the block outlives the chat. Adding the contact shows it again.
+   */
+  hidden?: boolean;
   /** Hue (0-359) for the generated avatar. */
   hue: number;
 }

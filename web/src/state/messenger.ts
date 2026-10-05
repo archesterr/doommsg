@@ -280,6 +280,11 @@ export class Messenger {
     if (!/^[a-z0-9_]{3,32}$/.test(username)) throw new ApiError(400, 'bad_username');
     if (username === this.username) throw new ApiError(400, 'self');
     const existing = this.contact(username);
+    if (existing?.hidden) {
+      const shown = { ...existing, hidden: false, lastTs: Date.now() };
+      await this.saveContact(shown);
+      return shown;
+    }
     if (existing) return existing;
     const id = await this.api.identityOf(username);
     const c = newContact(username, { sigKey: id.sigKey, dhKey: id.dhKey });
@@ -312,18 +317,25 @@ export class Messenger {
   /**
    * Deletes the history and the contact. The ratchet session stays: the peer
    * still uses it, and their next message brings the chat back (re-checked
-   * against the directory like any first contact).
+   * against the directory like any first contact). A blocked contact is
+   * kept, hidden, so that deleting the chat does not lift the block.
    */
   async deleteChat(username: string): Promise<void> {
+    const c = this.contact(username);
     await db.deleteConversation(username);
-    await db.del('contacts', username);
+    const kept: Contact | undefined = c?.blocked
+      ? { ...c, hidden: true, unread: 0, lastPreview: undefined, identityChanged: undefined }
+      : undefined;
+    if (kept) await db.put('contacts', username, kept);
+    else await db.del('contacts', username);
     // A receipt sent now would only re-create the contact.
     this.receipts.delivered.delete(username);
     this.receipts.read.delete(username);
     useApp.setState((s) => {
       const contacts = { ...s.contacts };
       const messages = { ...s.messages };
-      delete contacts[username];
+      if (kept) contacts[username] = kept;
+      else delete contacts[username];
       delete messages[username];
       return { contacts, messages, active: s.active === username ? undefined : s.active };
     });

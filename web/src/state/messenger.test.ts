@@ -285,6 +285,35 @@ describe('deleted chats (#10)', () => {
     expect(h.acks.flat()).toEqual([1, 2]);
   });
 
+  it('keeps a blocked contact blocked after its chat is deleted', async () => {
+    const { request } = await createIdentity('alice');
+    const h = harness();
+    const bobId = newIdentity();
+    h.m.api.identityOf = async () => ({ sigKey: bobId.sig.pub, dhKey: bobId.dh.pub, dhKeySig: bobId.dhSig });
+    const bob = new SessionCipher(new MemoryStore(bobId), {
+      fetchBundle: async () => bundleOf(request),
+      checkIdentity: async () => {},
+    });
+    const fromBob = async (sid: number, id: string, body: string) =>
+      h.deliver({ sid, from: 'bob', payload: await bob.encrypt('alice', utf8(text(id, body))) });
+
+    await fromBob(1, 'm1', 'hi');
+    await h.idle();
+    await h.m.setBlocked('bob', true);
+    await h.m.deleteChat('bob');
+    expect(h.m.contact('bob')).toMatchObject({ blocked: true, hidden: true });
+
+    // Bob's next message is dropped, as before the chat was deleted.
+    await fromBob(2, 'm2', 'let me back in');
+    await h.idle();
+    expect(await db.getMessage('m2')).toBeUndefined();
+    expect(h.m.contact('bob')).toMatchObject({ blocked: true, hidden: true });
+    expect(h.acks.flat()).toEqual([1, 2]);
+
+    // Adding him again shows the contact, still blocked.
+    expect(await h.m.addContact('bob')).toMatchObject({ blocked: true, hidden: false });
+  });
+
   it('does not silently drop an undecryptable message from someone without a chat', async () => {
     await createIdentity('alice');
     const h = harness();
