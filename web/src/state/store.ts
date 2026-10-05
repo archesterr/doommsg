@@ -57,7 +57,27 @@ function insertSorted(list: ChatMessage[], m: ChatMessage): ChatMessage[] {
   return [...list.slice(0, i), m, ...list.slice(i)];
 }
 
+/** Ids removed while a page of a conversation was loading, by peer. */
+const removedWhileLoading = new Map<string, Set<string>[]>();
+
+/**
+ * Starts recording the messages of `peer` removed from here on; call the
+ * result once the page has loaded to stop and get them. A page read from
+ * the database just before a removal would otherwise bring it back.
+ */
+export function trackRemovals(peer: string): () => Set<string> {
+  const ids = new Set<string>();
+  removedWhileLoading.set(peer, [...(removedWhileLoading.get(peer) ?? []), ids]);
+  return () => {
+    const rest = (removedWhileLoading.get(peer) ?? []).filter((s) => s !== ids);
+    if (rest.length) removedWhileLoading.set(peer, rest);
+    else removedWhileLoading.delete(peer);
+    return ids;
+  };
+}
+
 export function removeMessages(peer: string, ids: Set<string>): void {
+  for (const loading of removedWhileLoading.get(peer) ?? []) for (const id of ids) loading.add(id);
   useApp.setState((s) => {
     const list = s.messages[peer];
     if (!list) return {};

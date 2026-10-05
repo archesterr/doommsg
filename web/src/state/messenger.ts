@@ -19,7 +19,7 @@ import {
   signedPreKeyAge,
   SPK_ROTATE_MS,
 } from '../storage/keystore';
-import { removeMessages, setContact, toast, upsertMessage, useApp } from './store';
+import { removeMessages, setContact, toast, trackRemovals, upsertMessage, useApp } from './store';
 import { defaultSettings, type Account, type ChatMessage, type Contact, type Settings } from './types';
 
 // ---- inner (encrypted) content protocol ----------------------------------
@@ -371,10 +371,12 @@ export class Messenger {
       // An empty list first, so that messages saved while the page loads
       // are kept by upsertMessage instead of being lost to the snapshot.
       useApp.setState((s) => ({ messages: { ...s.messages, [peer]: [] } }));
+      const removed = trackRemovals(peer);
       let list: ChatMessage[];
       try {
         list = await db.messagesFor<ChatMessage>(peer);
       } catch (e) {
+        removed();
         useApp.setState((s) => {
           const messages = { ...s.messages };
           delete messages[peer];
@@ -382,10 +384,12 @@ export class Messenger {
         });
         throw e;
       }
+      // Messages deleted or expired while the page loaded stay deleted.
+      const gone = removed();
       useApp.setState((s) => {
         const live = s.messages[peer];
         if (!live) return {}; // the chat was deleted meanwhile
-        return { messages: { ...s.messages, [peer]: mergeMessages(list, live) } };
+        return { messages: { ...s.messages, [peer]: mergeMessages(list.filter((m) => !gone.has(m.id)), live) } };
       });
     }
     await this.markRead(peer);
@@ -394,7 +398,13 @@ export class Messenger {
   async loadOlder(peer: string): Promise<boolean> {
     const list = useApp.getState().messages[peer] ?? [];
     if (!list.length) return false;
-    const older = await db.messagesFor<ChatMessage>(peer, 100, list[0].ts);
+    const removed = trackRemovals(peer);
+    const page = await db.messagesFor<ChatMessage>(peer, 100, list[0].ts).catch((e: unknown) => {
+      removed();
+      throw e;
+    });
+    const gone = removed();
+    const older = page.filter((m) => !gone.has(m.id));
     if (!older.length) return false;
     useApp.setState((s) => ({ messages: { ...s.messages, [peer]: [...older, ...(s.messages[peer] ?? [])] } }));
     return true;

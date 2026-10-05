@@ -52,6 +52,24 @@ describe('opening a conversation (#17)', () => {
     expect(list[1].body).toBe('edited');
   });
 
+  it('does not bring back a message deleted while the conversation loads', async () => {
+    hooks.afterSnapshot = () => m.deleteLocal(msg('h1', 1001));
+    await m.open('bob');
+    expect(useApp.getState().messages.bob.map((x) => x.id)).toEqual(['h0', 'h2']);
+  });
+
+  it('does not bring back a message deleted while older ones load', async () => {
+    for (let i = 0; i < 250; i++) await db.putMessage(msg(`o${i}`, i));
+    await m.open('bob'); // the newest 200
+    const first = useApp.getState().messages.bob[0];
+    expect(first.id).not.toBe('o0');
+    hooks.afterSnapshot = () => m.deleteLocal(msg('o0', 0));
+    await m.loadOlder('bob');
+    const ids = useApp.getState().messages.bob.map((x) => x.id);
+    expect(ids).toContain('o1');
+    expect(ids).not.toContain('o0');
+  });
+
   it('does not bring back a chat deleted while it loads', async () => {
     hooks.afterSnapshot = () => m.deleteChat('bob');
     await m.open('bob');
