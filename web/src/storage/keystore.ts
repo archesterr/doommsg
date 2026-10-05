@@ -40,8 +40,24 @@ export const localKeyStore: KeyStore = {
   deleteSession: (peer) => db.del('sessions', peer),
 };
 
-async function counters(): Promise<Counters> {
-  return (await db.get<Counters>('kv', 'counters')) ?? { nextOtkId: 1, nextSpkId: 1 };
+let countersLock: Promise<unknown> = Promise.resolve();
+
+/**
+ * Reserves `n` consecutive key ids and returns the first. The counter is
+ * advanced (and stored) before any key is made, one caller at a time, so
+ * overlapping or interrupted runs never hand out the same id twice.
+ */
+function reserveIds(counter: keyof Counters, n: number): Promise<number> {
+  const run = async () => {
+    const c = (await db.get<Counters>('kv', 'counters')) ?? { nextOtkId: 1, nextSpkId: 1 };
+    const first = c[counter];
+    c[counter] = first + n;
+    await db.put('kv', 'counters', c);
+    return first;
+  };
+  const next = countersLock.then(run, run);
+  countersLock = next.catch(() => undefined);
+  return next;
 }
 
 function spkJSON(id: Identity, spk: StoredSPK) {
@@ -50,23 +66,20 @@ function spkJSON(id: Identity, spk: StoredSPK) {
 
 /** Generates and stores `n` one-time prekeys; returns their public halves. */
 export async function generateOneTimePreKeys(n = OTK_BATCH): Promise<{ keyId: number; pub: string }[]> {
-  const c = await counters();
+  const first = await reserveIds('nextOtkId', n);
   const out: { keyId: number; pub: string }[] = [];
-  for (let i = 0; i < n; i++) {
-    const keyId = c.nextOtkId++;
+  for (let keyId = first; keyId < first + n; keyId++) {
     const kp = newDHKeyPair();
     await db.put('prekeys', keyId, kp);
     out.push({ keyId, pub: b64(kp.pub) });
   }
-  await db.put('kv', 'counters', c);
   return out;
 }
 
 /** Creates a fresh signed prekey and retires the current one. */
 export async function rotateSignedPreKey(): Promise<{ keyId: number; pub: string; sig: string }> {
   const id = await localKeyStore.identity();
-  const c = await counters();
-  const spk: StoredSPK = { ...newDHKeyPair(), keyId: c.nextSpkId++, createdAt: Date.now() };
+  const spk: StoredSPK = { ...newDHKeyPair(), keyId: await reserveIds('nextSpkId', 1), createdAt: Date.now() };
   const cur = await db.get<StoredSPK>('kv', 'spk:current');
   if (cur) {
     const now = Date.now();
@@ -77,7 +90,6 @@ export async function rotateSignedPreKey(): Promise<{ keyId: number; pub: string
     await db.put('kv', 'spk:old', old);
   }
   await db.put('kv', 'spk:current', spk);
-  await db.put('kv', 'counters', c);
   return spkJSON(id, spk);
 }
 

@@ -219,9 +219,10 @@ export class Socket {
     });
   }
 
-  ack(sids: number[]): void {
-    if (sids.length && this.ws && this.state === 'online') {
-      this.ws.send(JSON.stringify({ type: 'ack', ids: sids }));
-    }
+  /** Acknowledges stored envelopes; false when there is no connection to do it on. */
+  ack(sids: number[]): boolean {
+    if (!this.ws || this.state !== 'online') return false;
+    if (sids.length) this.ws.send(JSON.stringify({ type: 'ack', ids: sids }));
+    return true;
   }
 }
